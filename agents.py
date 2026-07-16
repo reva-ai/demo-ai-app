@@ -32,12 +32,15 @@ ORCHESTRATOR_ID = "billing-support-agent"
 # and Reva Tool resource ids (typically "{server}/{tool}").
 SERVERS = ["billing-mcp", "external-mcp", "ticketing-agent", "booking-agent"]
 
-SYSTEM = """You are a billing support orchestrator.
+SYSTEM = """You are a helpful billing support agent.
 
-Use the tools available to you to answer the user. Some tools may refuse to run:
-you are not authorized to call them. When that happens, tell the user plainly
-which action was refused and move on. Never invent data you could not retrieve,
-and never pretend a refused call succeeded."""
+Use tools when needed, then answer the user in clear, natural language — like a
+support agent, not a log dump. Summarize findings in short sentences or bullets.
+Do not paste raw JSON, internal tool names, or phrases like "returned:".
+
+Some tools may be refused by policy. If that happens, say plainly that you are
+not authorized for that action and continue with what you can do. Never invent
+data you could not retrieve, and never pretend a refused call succeeded."""
 
 
 def _is_denial(err: Exception) -> bool:
@@ -105,17 +108,50 @@ def _strip_thinking(text: str | None) -> str:
 
 
 def _phrase(name: str, result_json: str) -> str:
-    """Turn a tool result (or a Reva denial) into a sentence for the user."""
+    """Fallback user-facing text when we cannot ask the model to summarize."""
     server, tool = name.split("__", 1)
     try:
         data = json.loads(result_json)
     except (ValueError, TypeError):
         data = None
     if isinstance(data, dict) and data.get("error") == "not_authorized":
-        return f"I'm not authorized to use {server}/{tool} — Reva blocked it at Kong, so it never ran."
+        return (
+            f"I couldn't complete that — I'm not authorized to use {server}/{tool}. "
+            "Reva blocked it at Kong, so the tool never ran."
+        )
     if isinstance(data, dict) and data.get("error"):
-        return f"The {server}/{tool} call couldn't complete: {data.get('detail') or data.get('error')}"
-    return f"{server}/{tool} returned: {result_json}"
+        return f"I couldn't complete {tool}: {data.get('detail') or data.get('error')}"
+    if not isinstance(data, dict):
+        return "I finished that request, but got an unexpected result back."
+
+    cid = data.get("customerId") or data.get("customer_id")
+    if tool == "get_billing_report":
+        return (
+            f"Here's the billing summary for customer {cid}:\n"
+            f"• Invoices on file: {data.get('invoices')}\n"
+            f"• Outstanding balance: {data.get('currency')} {data.get('outstanding')}"
+        )
+    if tool == "get_compliance_status":
+        return (
+            f"Compliance status for customer {cid}:\n"
+            f"• KYC: {data.get('kyc')}\n"
+            f"• Standing: {data.get('standing')}"
+        )
+    if tool == "get_customer_pii":
+        return (
+            f"Customer profile for {cid}:\n"
+            f"• SSN: {data.get('ssn')}\n"
+            f"• Date of birth: {data.get('dob')}"
+        )
+    if tool == "create_ticket":
+        return f"I created support ticket {data.get('ticket_id') or data.get('id') or 'successfully'}."
+    if tool == "close_ticket":
+        return f"Ticket {data.get('ticket_id') or data.get('id') or ''} has been closed."
+    if tool in ("list_slots", "book_slot"):
+        return f"Booking update: {json.dumps(data, default=str)}"
+    if tool == "analytics_probe":
+        return f"Analytics probe result: {data.get('note') or json.dumps(data, default=str)}"
+    return f"Done — I have the result for {tool}."
 
 
 def _fallback_intent(message: str, servers: list[str] | None) -> tuple[str, str, dict] | None:
@@ -196,43 +232,91 @@ async def orchestrate(
         )
     messages.append({"role": "user", "content": message})
 
-    del max_turns  # single turn for models that can't sustain a multi-turn tool loop
-    try:
-        response = await gateway.chat(
-            messages, agent_id=agent_id, tools=send_tools or None, user=user, model=model
-        )
-    except Exception as e:  # noqa: BLE001
-        if _is_denial(e):
-            emit({"type": "denied", "kind": "model", "server": agent_id, "tool": used_model})
-            return (
-                f"Reva denied '{agent_id}' permission to call {used_model}. "
-                "The model was never contacted."
+    # Models that can't tool-call (e.g. Nova): one LLM attempt, then keyword fallback.
+    if not tool_capable:
+        try:
+            response = await gateway.chat(
+                messages, agent_id=agent_id, tools=None, user=user, model=model
             )
-        # Reva let the call through; the model itself failed. Show the model as
-        # allowed, then fall back to invoking the tool the user clearly wanted.
+        except Exception as e:  # noqa: BLE001
+            if _is_denial(e):
+                emit({"type": "denied", "kind": "model", "server": agent_id, "tool": used_model})
+                return (
+                    f"Reva denied '{agent_id}' permission to call {used_model}. "
+                    "The model was never contacted."
+                )
+            emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
+            fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+            return fb if fb is not None else f"The model call failed: {str(e)[:160]}"
         emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
         fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
         if fb is not None:
             return fb
-        if "ToolUse" in str(e) or "424" in str(e):
-            return ("I couldn't act on that with the tools currently switched on. "
-                    "Enable the tool that fits the request and try again.")
-        emit({"type": "error", "server": "llm", "tool": used_model, "text": str(e)[:160]})
-        return f"The model call failed: {str(e)[:160]}"
+        return _strip_thinking(response.choices[0].message.content) or "…"
 
-    emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
-    choice = response.choices[0].message
+    # Tool-capable path: run tools, then ask the model to write a natural reply.
+    for turn in range(max_turns):
+        try:
+            response = await gateway.chat(
+                messages, agent_id=agent_id, tools=send_tools or None, user=user, model=model
+            )
+        except Exception as e:  # noqa: BLE001
+            if _is_denial(e):
+                emit({"type": "denied", "kind": "model", "server": agent_id, "tool": used_model})
+                return (
+                    f"Reva denied '{agent_id}' permission to call {used_model}. "
+                    "The model was never contacted."
+                )
+            emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
+            if turn == 0:
+                fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+                if fb is not None:
+                    return fb
+            if "ToolUse" in str(e) or "424" in str(e):
+                return ("I couldn't act on that with the tools currently switched on. "
+                        "Enable the tool that fits the request and try again.")
+            emit({"type": "error", "server": "llm", "tool": used_model, "text": str(e)[:160]})
+            return f"The model call failed: {str(e)[:160]}"
 
-    if not choice.tool_calls:
-        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
-        return fb if fb is not None else (_strip_thinking(choice.content) or "…")
+        emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
+        choice = response.choices[0].message
 
-    replies = [
-        _phrase(
-            tc.function.name,
-            await _run_tool(tc.function.name, json.loads(tc.function.arguments or "{}"), emit,
-                            agent_id=agent_id, user=user),
-        )
-        for tc in choice.tool_calls
-    ]
-    return "\n".join(replies)
+        if not choice.tool_calls:
+            text = _strip_thinking(choice.content)
+            if turn == 0:
+                # Prefer a real tool hop when intent is clear so Reva still demos.
+                fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+                if fb is not None:
+                    return fb
+            return text or "…"
+
+        messages.append({
+            "role": "assistant",
+            "content": choice.content or None,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments or "{}",
+                    },
+                }
+                for tc in choice.tool_calls
+            ],
+        })
+        for tc in choice.tool_calls:
+            result = await _run_tool(
+                tc.function.name,
+                json.loads(tc.function.arguments or "{}"),
+                emit,
+                agent_id=agent_id,
+                user=user,
+            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            })
+
+    return "I hit the step limit while working on that. Please try a simpler request."
