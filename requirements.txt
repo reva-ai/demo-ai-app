@@ -1,0 +1,9 @@
+# Floors, not exact pins — lets prebuilt wheels resolve across Python 3.12+.
+fastapi>=0.115
+uvicorn[standard]>=0.34
+httpx>=0.28
+pydantic>=2.10
+fastmcp>=2.0
+python-dotenv>=1.0
+# LLM calls go through Kong via the OpenAI-compatible client.
+openai>=1.0
