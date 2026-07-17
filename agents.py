@@ -4,13 +4,14 @@ Three agents, one gateway:
 
     user -> orchestrator-agent  --LLM-->      Kong -> upstream LLM
                                 --MCP-->      Kong -> billing-mcp / external-mcp
-                                --MCP-->      Kong -> ticketing-agent / booking-agent
+                                --A2A-->      Kong -> ticketing-agent / booking-agent
 
-The sub-agents are reached as MCP servers rather than as direct HTTP calls.
-Kong only sees traffic that traverses its routes; a plain agent-to-agent HTTP
-request would never hit the Reva plugin. Exposing each sub-agent as an MCP
-server makes "orchestrator delegates to ticketing" an MCP tool call — so it
-routes through Kong and can be allowed or denied by Reva.
+Tools are reached over MCP; sub-agents are reached over the A2A protocol
+(message/send). Kong only sees traffic that traverses its routes, so both hops
+are governed: "orchestrator delegates to ticketing" is a standard A2A call that
+routes through Kong and can be allowed or denied by Reva. The conversation
+travels the A2A-native way — current turn as the message text, prior turns in
+metadata.chatHistory, thread as contextId — so Reva evaluates with full context.
 
 A denied tool call is NOT an error here. It is fed back to the model as a tool
 result saying it was not authorized, so the model explains itself to the user in
@@ -28,9 +29,39 @@ import gateway
 
 ORCHESTRATOR_ID = "billing-support-agent"
 
-# MCP server path segments under KONG_MCP_URL. Names must match Kong routes
-# and Reva Tool resource ids (typically "{server}/{tool}").
-SERVERS = ["billing-mcp", "external-mcp", "ticketing-agent", "booking-agent"]
+# Two kinds of downstream, two protocols:
+#   TOOL_SERVERS  — plain capabilities, reached over MCP (invokeTool via Kong).
+#   AGENT_SERVERS — sub-agents, reached over A2A message/send (invokeAgent via Kong).
+# Names must match Kong route path segments and Reva resource ids.
+TOOL_SERVERS = ["billing-mcp", "external-mcp"]
+AGENT_SERVERS = ["ticketing-agent", "booking-agent"]
+SERVERS = TOOL_SERVERS + AGENT_SERVERS
+
+# The orchestrator offers each sub-agent to the model as a single delegate
+# function; picking it triggers an A2A hop, not an MCP tool call.
+_AGENT_DESCRIPTIONS = {
+    "ticketing-agent": "Delegate to the ticketing agent to open/close and triage support tickets.",
+    "booking-agent": "Delegate to the booking agent to list or book customer callback slots.",
+}
+
+
+def _agent_function(agent: str) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": f"{agent}__invoke",
+            "description": _AGENT_DESCRIPTIONS.get(agent, f"Delegate a task to {agent}."),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "request": {"type": "string",
+                                "description": "The task for the agent, in natural language."}
+                },
+                "required": ["request"],
+            },
+        },
+    }
 
 SYSTEM = """You are a helpful billing support agent.
 
@@ -63,6 +94,10 @@ async def _available_tools(
     """
     tools: list[dict[str, Any]] = []
     for server in (servers if servers is not None else SERVERS):
+        if server in AGENT_SERVERS:
+            # A2A sub-agent: one delegate function, no MCP discovery hop.
+            tools.append(_agent_function(server))
+            continue
         try:
             tools.extend(await gateway.list_tools(server, agent_id=agent_id, user=user))
         except Exception as e:  # noqa: BLE001
@@ -71,10 +106,38 @@ async def _available_tools(
 
 
 async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
-                    *, agent_id: str | None = None, user: str | None = None) -> str:
-    """Execute one tool call and return what the model should see as its result."""
+                    *, agent_id: str | None = None, user: str | None = None,
+                    history: list[dict[str, Any]] | None = None,
+                    session_id: str | None = None) -> str:
+    """Execute one tool call and return what the model should see as its result.
+
+    Sub-agents (AGENT_SERVERS) go over A2A: the conversation is forwarded as the
+    message text + metadata.chatHistory so the sub-agent — and Reva — see full
+    context. Everything else is an MCP tool call.
+    """
     server, tool = name.split("__", 1)
     emit({"type": "tool_call", "server": server, "tool": tool, "arguments": arguments})
+
+    if server in AGENT_SERVERS:
+        request_text = arguments.get("request") if isinstance(arguments, dict) else None
+        request_text = request_text or json.dumps(arguments, default=str)
+        try:
+            reply = await gateway.send_agent(
+                server, request_text, history=history, session_id=session_id,
+                agent_id=agent_id, user=user,
+            )
+        except Exception as e:  # noqa: BLE001
+            if _is_denial(e):
+                emit({"type": "denied", "server": server, "tool": tool})
+                return json.dumps(
+                    {"error": "not_authorized",
+                     "detail": f"Reva denied delegation to {server}. The agent was never invoked."}
+                )
+            emit({"type": "error", "server": server, "tool": tool, "text": str(e)[:120]})
+            return json.dumps({"error": "agent_failed", "detail": str(e)[:200]})
+        emit({"type": "allowed", "server": server, "tool": tool, "result": reply})
+        return json.dumps({"agent_reply": reply})
+
     try:
         result = await gateway.call_tool(server, tool, arguments, agent_id=agent_id, user=user)
     except Exception as e:  # noqa: BLE001
@@ -114,7 +177,14 @@ def _phrase(name: str, result_json: str) -> str:
         data = json.loads(result_json)
     except (ValueError, TypeError):
         data = None
+    if isinstance(data, dict) and "agent_reply" in data:
+        return data["agent_reply"]
     if isinstance(data, dict) and data.get("error") == "not_authorized":
+        if server in AGENT_SERVERS:
+            return (
+                f"I couldn't delegate that to {server} — Reva blocked the hand-off at Kong, "
+                "so the agent was never invoked."
+            )
         return (
             f"I couldn't complete that — I'm not authorized to use {server}/{tool}. "
             "Reva blocked it at Kong, so the tool never ran."
@@ -177,22 +247,24 @@ def _fallback_intent(message: str, servers: list[str] | None) -> tuple[str, str,
     if on("external-mcp") and ("probe" in m or "analytics" in m or "external" in m):
         return "external-mcp", "analytics_probe", {"query": message}
     if on("ticketing-agent") and "ticket" in m:
-        return "ticketing-agent", "create_ticket", {"customer_id": customer, "summary": message}
+        return "ticketing-agent", "invoke", {"request": message}
     if on("booking-agent") and ("book" in m or "appointment" in m or "slot" in m):
-        return "booking-agent", "book_slot", {"customer_id": customer, "slot": "2026-07-14T10:00Z"}
+        return "booking-agent", "invoke", {"request": message}
     return None
 
 
 async def _run_fallback(
     message: str, servers: list[str] | None, emit: Callable[[dict], None],
     *, agent_id: str | None = None, user: str | None = None,
+    history: list[dict[str, Any]] | None = None, session_id: str | None = None,
 ) -> str | None:
     """If the prompt maps to a tool, call it directly and phrase the outcome."""
     intent = _fallback_intent(message, servers)
     if not intent:
         return None
     server, tool, args = intent
-    result = await _run_tool(f"{server}__{tool}", args, emit, agent_id=agent_id, user=user)
+    result = await _run_tool(f"{server}__{tool}", args, emit, agent_id=agent_id, user=user,
+                             history=history, session_id=session_id)
     return _phrase(f"{server}__{tool}", result)
 
 
@@ -205,6 +277,7 @@ async def orchestrate(
     model: str | None = None,
     servers: list[str] | None = None,
     history: list[dict[str, Any]] | None = None,
+    session_id: str | None = None,
     max_turns: int = 6,
 ) -> str:
     """Run the agent loop for one user message. `emit` streams trace events to the UI.
@@ -223,14 +296,17 @@ async def orchestrate(
     # (e.g. Nova). The keyword→tool fallback still runs tools through Kong/Reva.
     tool_capable = "nova" not in (used_model or "").lower()
     send_tools = tools if tool_capable else None
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM}]
-    if history:
-        messages.extend(
-            {"role": m["role"], "content": m["content"]}
-            for m in history
-            if isinstance(m, dict) and m.get("role") and m.get("content")
-        )
-    messages.append({"role": "user", "content": message})
+    # The conversation to forward on A2A delegations: prior user/assistant turns
+    # plus the current message. Sub-agents receive this as metadata.chatHistory so
+    # Reva evaluates the invokeAgent hop with the same context the orchestrator has.
+    convo: list[dict[str, Any]] = [
+        {"role": m["role"], "content": m["content"]}
+        for m in (history or [])
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+    convo.append({"role": "user", "content": message})
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM}, *convo]
 
     # Models that can't tool-call (e.g. Nova): one LLM attempt, then keyword fallback.
     if not tool_capable:
@@ -246,10 +322,12 @@ async def orchestrate(
                     "The model was never contacted."
                 )
             emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
-            fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+            fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
+                                 history=convo, session_id=session_id)
             return fb if fb is not None else f"The model call failed: {str(e)[:160]}"
         emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
-        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
+                                 history=convo, session_id=session_id)
         if fb is not None:
             return fb
         return _strip_thinking(response.choices[0].message.content) or "…"
@@ -269,7 +347,8 @@ async def orchestrate(
                 )
             emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
             if turn == 0:
-                fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+                fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
+                                 history=convo, session_id=session_id)
                 if fb is not None:
                     return fb
             if "ToolUse" in str(e) or "424" in str(e):
@@ -285,7 +364,8 @@ async def orchestrate(
             text = _strip_thinking(choice.content)
             if turn == 0:
                 # Prefer a real tool hop when intent is clear so Reva still demos.
-                fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+                fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
+                                 history=convo, session_id=session_id)
                 if fb is not None:
                     return fb
             return text or "…"
@@ -312,6 +392,8 @@ async def orchestrate(
                 emit,
                 agent_id=agent_id,
                 user=user,
+                history=convo,
+                session_id=session_id,
             )
             messages.append({
                 "role": "tool",

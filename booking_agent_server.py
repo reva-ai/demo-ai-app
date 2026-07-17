@@ -1,37 +1,66 @@
-"""booking-agent — the second sub-agent, exposed as MCP for the same reason.
+"""booking-agent — the second sub-agent, exposed over A2A for the same reason.
 
 Companion to ticketing_agent_server.py. Two sub-agents rather than one because
 agent-to-agent traffic needs a choice: a policy can permit one delegation while
 forbidding the other.
 
-Kong route / path segment must be `booking-agent`.
+Kong A2A route path segment must be `booking-agent`.
 
 Run:
-    .venv/bin/python booking_agent_server.py         # http://127.0.0.1:8004/mcp
+    .venv/bin/python booking_agent_server.py         # http://127.0.0.1:8004/
 """
 
-import os
+from __future__ import annotations
 
-from fastmcp import FastMCP
+import re
+from typing import Any
 
-mcp = FastMCP("booking-agent")
+from a2a.types import AgentSkill
+
+import a2a_agent
 
 _SLOTS = ["2026-07-14T10:00Z", "2026-07-14T14:00Z", "2026-07-15T09:00Z"]
+_SLOT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z")
 
 
-@mcp.tool
-def list_slots() -> dict:
-    """List available callback slots for a customer support call."""
-    return {"slots": _SLOTS}
+async def handle(text: str, history: list[dict[str, Any]], user: str | None, session_id: str | None) -> str:
+    """Delegated task from the orchestrator: list or book a callback slot."""
+    lowered = text.lower()
+    if "list" in lowered or "available" in lowered or "slot" in lowered and "book" not in lowered:
+        return "Available callback slots: " + ", ".join(_SLOTS)
 
-
-@mcp.tool
-def book_slot(customer_id: str, slot: str) -> dict:
-    """Book a callback slot for a customer."""
+    wanted = _SLOT_RE.search(text)
+    slot = wanted.group(0) if wanted else _SLOTS[0]
     if slot not in _SLOTS:
-        return {"error": "slot unavailable", "slot": slot}
-    return {"booked": True, "customer_id": customer_id, "slot": slot}
+        return f"Slot {slot} is unavailable. Options: " + ", ".join(_SLOTS)
+    return f"Booked callback slot {slot}."
+
+
+SKILLS = [
+    AgentSkill(
+        id="list_slots",
+        name="List slots",
+        description="List available callback slots for a customer support call.",
+        tags=["booking", "scheduling"],
+        examples=["What callback slots are available?"],
+    ),
+    AgentSkill(
+        id="book_slot",
+        name="Book slot",
+        description="Book a callback slot for a customer.",
+        tags=["booking", "scheduling"],
+        examples=["Book the 2026-07-14T10:00Z callback slot for customer c1."],
+    ),
+]
+
+
+app = a2a_agent.build_app(
+    name="booking-agent",
+    description="Scheduling sub-agent: lists and books customer callback slots on delegation.",
+    skills=SKILLS,
+    handler=handle,
+)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=int(os.environ.get("PORT", "8004")))
+    a2a_agent.run(app, default_port="8004")

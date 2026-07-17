@@ -214,6 +214,11 @@ const send = document.getElementById('send');
 const reset = document.getElementById('reset');
 let cleared = false;
 let convo = [];   // accumulated conversation turns for context-building
+// Stable thread id for this conversation → A2A contextId → Reva session.id.
+// Regenerated on reset so each session is one thread.
+const newSessionId = () =>
+  (crypto.randomUUID ? crypto.randomUUID() : 'thread-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+let sessionId = newSessionId();
 
 // The agent is always the billing-support-agent (that's the front door). Two dials
 // vary what Reva authorizes on: what the agent reasons with (model) and whom it
@@ -340,6 +345,7 @@ async function ask() {
     body: JSON.stringify({
       message, agent_id: AGENT_ID, model: dials.model, user: dials.user,
       history: convo,   // prior turns → payload builds context across the session
+      session_id: sessionId,   // one thread id per session → A2A contextId
     })
   });
 
@@ -381,6 +387,7 @@ reset.onclick = () => {
     '<span class="sugg">Now get the customer PII for c1</span></div>';
   clearTrace();
   convo = [];   // new session → context starts fresh
+  sessionId = newSessionId();   // new thread id for the fresh session
   box.disabled = false; send.disabled = false; box.value = ''; box.focus();
 };
 
