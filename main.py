@@ -42,6 +42,8 @@ class ChatRequest(BaseModel):
     servers: list[str] | None = None
     # Prior turns [{role, content}, …] the client carries across a session.
     history: list[dict[str, Any]] | None = None
+    # Stable thread id for the conversation → A2A contextId → Reva session.id.
+    session_id: str | None = None
 
 
 @app.post("/chat")
@@ -54,7 +56,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             reply = await agents.orchestrate(
                 req.message, user=req.user, agent_id=req.agent_id,
                 model=req.model, servers=req.servers, history=req.history,
-                emit=queue.put_nowait,
+                session_id=req.session_id, emit=queue.put_nowait,
             )
             queue.put_nowait({"type": "reply", "text": reply})
         except Exception as e:  # noqa: BLE001

@@ -3,8 +3,11 @@
 #   agent-app        chat UI + orchestrator (/, /chat, /healthz)
 #   billing-mcp      MCP tools governed by Reva (via Kong)
 #   external-mcp     untrusted MCP (typically forbidden)
-#   ticketing-agent  sub-agent as MCP (own LLM hop via Kong)
-#   booking-agent    second sub-agent as MCP
+#   ticketing-agent  sub-agent as A2A (own LLM hop via Kong)
+#   booking-agent    second sub-agent as A2A
+#
+# Tools are MCP; sub-agents speak A2A (message/send). Kong fronts /mcp/* and
+# /a2a/* routes so both hops are authorized by Reva.
 #
 # Deploy: push this dir to a Git repo -> Render -> New -> Blueprint -> pick the repo.
 # Point Kong upstreams at the four MCP/agent service URLs after deploy.
@@ -29,6 +32,9 @@ services:
       - key: KONG_LLM_URL
         sync: false
       - key: KONG_MCP_URL
+        sync: false
+      # A2A base for sub-agents: each agent hangs off this as /<agent-name>.
+      - key: KONG_A2A_URL
         sync: false
       - key: KONG_API_KEY
         sync: false

@@ -11,8 +11,13 @@ Deny contract: Kong should respond HTTP 403 with a body/message containing
 from __future__ import annotations
 
 import os
+import uuid
 from typing import Any
 
+import httpx
+from a2a.client import A2AClient
+from a2a.types import Message, MessageSendParams, Part, Role, SendMessageRequest, TextPart
+from a2a.utils import get_message_text
 from dotenv import load_dotenv
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
@@ -26,6 +31,8 @@ KONG_API_KEY = os.environ.get("KONG_API_KEY", "").strip()
 KONG_LLM_URL = os.environ.get("KONG_LLM_URL", "").rstrip("/")
 # Each MCP server hangs off this as /<server-name>/mcp.
 KONG_MCP_URL = os.environ.get("KONG_MCP_URL", "").rstrip("/")
+# Each A2A sub-agent hangs off this as /<agent-name> (JSON-RPC message/send).
+KONG_A2A_URL = os.environ.get("KONG_A2A_URL", "").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
 
 
@@ -49,6 +56,12 @@ def _require_mcp_url() -> str:
     if not KONG_MCP_URL:
         raise RuntimeError("KONG_MCP_URL is unset — copy .env.example to .env and fill it in")
     return KONG_MCP_URL
+
+
+def _require_a2a_url() -> str:
+    if not KONG_A2A_URL:
+        raise RuntimeError("KONG_A2A_URL is unset — copy .env.example to .env and fill it in")
+    return KONG_A2A_URL
 
 
 def _identity_headers(*, agent_id: str | None = None, user: str | None = None) -> dict[str, str]:
@@ -154,3 +167,56 @@ async def call_tool(server: str, tool: str, arguments: dict[str, Any],
     except Exception as e:  # noqa: BLE001
         _raise_if_denied(e)
         raise
+
+
+def _extract_a2a_text(resp: Any) -> str:
+    """Pull the agent's reply text out of a SendMessageResponse (Message or Task)."""
+    root = getattr(resp, "root", resp)
+    result = getattr(root, "result", None)
+    if result is None:
+        return ""
+    if getattr(result, "kind", None) == "message" or getattr(result, "parts", None) is not None:
+        try:
+            return get_message_text(result)
+        except Exception:  # noqa: BLE001
+            pass
+    history = getattr(result, "history", None)
+    if history:
+        return get_message_text(history[-1])
+    status = getattr(result, "status", None)
+    if status is not None and getattr(status, "message", None) is not None:
+        return get_message_text(status.message)
+    return str(result)
+
+
+async def send_agent(agent: str, text: str, *,
+                     history: list[dict[str, Any]] | None = None,
+                     session_id: str | None = None,
+                     agent_id: str | None = None, user: str | None = None) -> str:
+    """Delegate to a sub-agent via A2A `message/send`, routed through Kong.
+
+    The conversation travels the A2A-native way: the current turn as the message
+    text, prior turns in `metadata.chatHistory`, and the thread as `contextId`.
+    Kong reads that standard body to authorize the `invokeAgent` with Reva; a
+    denial comes back as HTTP 403 and surfaces here as AuthorizationDenied.
+    """
+    url = f"{_require_a2a_url()}/{agent}"
+    message = Message(
+        message_id=str(uuid.uuid4()),
+        role=Role.user,
+        parts=[Part(root=TextPart(text=text))],
+        context_id=session_id,
+        metadata={"chatHistory": history or [], "user": user},
+    )
+    request = SendMessageRequest(id=str(uuid.uuid4()), params=MessageSendParams(message=message))
+    headers = {"Authorization": f"Bearer {_require_key()}", **_identity_headers(agent_id=agent_id, user=user)}
+    try:
+        async with httpx.AsyncClient(headers=headers, timeout=90.0) as hc:
+            client = A2AClient(httpx_client=hc, url=url)
+            resp = await client.send_message(request)
+    except AuthorizationDenied:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _raise_if_denied(e)
+        raise
+    return _extract_a2a_text(resp)
