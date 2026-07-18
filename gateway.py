@@ -16,6 +16,7 @@ Deny contract: Kong should respond HTTP 403 with a body/message containing
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from typing import Any
@@ -31,6 +32,8 @@ from openai import APIStatusError, AsyncOpenAI
 
 load_dotenv()
 
+log = logging.getLogger("demo.gateway")
+
 # .strip() defensively: a key pasted into a hosting dashboard often picks up a
 # trailing newline, which makes httpx reject the Authorization header.
 KONG_API_KEY = os.environ.get("KONG_API_KEY", "").strip()
@@ -44,6 +47,10 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
 
 class AuthorizationDenied(Exception):
     """Kong (via Reva) refused this hop. Message always includes 'Blocked by Reva'."""
+
+
+def _tp(traceparent: str | None) -> str:
+    return (traceparent or "")[:50] or "(none)"
 
 
 def _require_key() -> str:
@@ -109,6 +116,12 @@ async def chat(
     `agent_id` / `user` → identity headers. `traceparent` is forwarded when the
     caller already has one; otherwise Kong mints it on the gateway.
     """
+    used = model or LLM_MODEL
+    log.info(
+        "kong llm → %s agent=%s user=%s model=%s tools=%d msgs=%d traceparent=%s",
+        _require_llm_url(), agent_id, user or "-", used,
+        len(tools or []), len(messages), _tp(traceparent),
+    )
     client = AsyncOpenAI(
         api_key=_require_key(),
         base_url=_require_llm_url(),
@@ -116,16 +129,30 @@ async def chat(
             agent_id=agent_id, user=user, traceparent=traceparent
         ),
     )
-    kwargs: dict[str, Any] = {"model": model or LLM_MODEL, "messages": messages}
+    kwargs: dict[str, Any] = {"model": used, "messages": messages}
     if tools:
         kwargs["tools"] = tools
     try:
-        return await client.chat.completions.create(**kwargs)
+        resp = await client.chat.completions.create(**kwargs)
+        choice = resp.choices[0].message if resp.choices else None
+        n_tools = len(choice.tool_calls or []) if choice else 0
+        log.info("kong llm ← ok agent=%s model=%s tool_calls=%d", agent_id, used, n_tools)
+        return resp
     except APIStatusError as e:
-        _raise_if_denied(e)
+        log.warning("kong llm ← http %s agent=%s: %s", e.status_code, agent_id, str(e)[:160])
+        try:
+            _raise_if_denied(e)
+        except AuthorizationDenied:
+            log.warning("kong llm ← DENIED agent=%s model=%s", agent_id, used)
+            raise
         raise
     except Exception as e:  # noqa: BLE001
-        _raise_if_denied(e)
+        log.warning("kong llm ← error agent=%s: %s", agent_id, str(e)[:160])
+        try:
+            _raise_if_denied(e)
+        except AuthorizationDenied:
+            log.warning("kong llm ← DENIED agent=%s model=%s", agent_id, used)
+            raise
         raise
 
 
@@ -162,11 +189,15 @@ async def list_tools(
     OpenAI rejects `/` in function names — and `/` is what Reva resource ids
     typically use, so the two conventions are translated at this boundary.
     """
+    log.info(
+        "kong mcp list_tools → %s/%s agent=%s traceparent=%s",
+        _require_mcp_url(), server, agent_id or "-", _tp(traceparent),
+    )
     try:
         async with _mcp_client(
             server, agent_id=agent_id, user=user, traceparent=traceparent
         ) as c:
-            return [
+            tools = [
                 {
                     "type": "function",
                     "function": {
@@ -177,7 +208,10 @@ async def list_tools(
                 }
                 for t in await c.list_tools()
             ]
+            log.info("kong mcp list_tools ← ok server=%s n=%d", server, len(tools))
+            return tools
     except Exception as e:  # noqa: BLE001
+        log.warning("kong mcp list_tools ← error server=%s: %s", server, str(e)[:160])
         _raise_if_denied(e)
         raise
 
@@ -196,15 +230,24 @@ async def call_tool(
     A Reva denial surfaces as AuthorizationDenied — the tool's code never runs.
     Callers should catch it and tell the user they were not authorized.
     """
+    log.info(
+        "kong mcp call → %s/%s tool=%s agent=%s args_keys=%s traceparent=%s",
+        _require_mcp_url(), server, tool, agent_id or "-",
+        sorted(arguments.keys()) if isinstance(arguments, dict) else "-",
+        _tp(traceparent),
+    )
     try:
         async with _mcp_client(
             server, agent_id=agent_id, user=user, traceparent=traceparent
         ) as c:
             result = await c.call_tool(tool, arguments)
+            log.info("kong mcp call ← ok server=%s tool=%s", server, tool)
             return result.structured_content or result.content
     except AuthorizationDenied:
+        log.warning("kong mcp call ← DENIED server=%s tool=%s", server, tool)
         raise
     except Exception as e:  # noqa: BLE001
+        log.warning("kong mcp call ← error server=%s tool=%s: %s", server, tool, str(e)[:160])
         _raise_if_denied(e)
         raise
 
@@ -246,6 +289,11 @@ async def send_agent(
     trace; if absent, Kong generates one and should forward it upstream.
     """
     url = f"{_require_a2a_url()}/{agent}"
+    log.info(
+        "kong a2a → %s agent_id=%s user=%s session=%s history=%d text_len=%d traceparent=%s",
+        url, agent_id or "-", user or "-", session_id or "-",
+        len(history or []), len(text or ""), _tp(traceparent),
+    )
     message = Message(
         message_id=str(uuid.uuid4()),
         role=Role.user,
@@ -267,8 +315,12 @@ async def send_agent(
             client = A2AClient(httpx_client=hc, url=url)
             resp = await client.send_message(request)
     except AuthorizationDenied:
+        log.warning("kong a2a ← DENIED agent=%s", agent)
         raise
     except Exception as e:  # noqa: BLE001
+        log.warning("kong a2a ← error agent=%s: %s", agent, str(e)[:160])
         _raise_if_denied(e)
         raise
-    return _extract_a2a_text(resp)
+    text_out = _extract_a2a_text(resp)
+    log.info("kong a2a ← ok agent=%s reply_len=%d", agent, len(text_out or ""))
+    return text_out

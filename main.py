@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,12 @@ from pydantic import BaseModel
 import agents
 
 load_dotenv(Path(__file__).with_name(".env"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+log = logging.getLogger("demo.main")
 
 _STATIC = Path(__file__).with_name("static")
 
@@ -55,6 +62,11 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     """
     # W3C Trace Context is a header, not a body field.
     traceparent = request.headers.get("traceparent")
+    log.info(
+        "chat start agent=%s user=%s model=%s session=%s traceparent=%s msg_len=%d history=%d",
+        req.agent_id, req.user, req.model or "(default)", req.session_id or "-",
+        traceparent or "(none)", len(req.message or ""), len(req.history or []),
+    )
     queue: asyncio.Queue = asyncio.Queue()
 
     async def run() -> None:
@@ -65,8 +77,10 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 session_id=req.session_id, traceparent=traceparent,
                 emit=queue.put_nowait,
             )
+            log.info("chat done agent=%s reply_len=%d", req.agent_id, len(reply or ""))
             queue.put_nowait({"type": "reply", "text": reply})
         except Exception as e:  # noqa: BLE001
+            log.exception("chat failed agent=%s: %s", req.agent_id, e)
             queue.put_nowait({"type": "error", "text": str(e)[:200]})
         finally:
             queue.put_nowait(None)

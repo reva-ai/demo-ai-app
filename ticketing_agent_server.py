@@ -21,12 +21,15 @@ Run:
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from a2a.types import AgentSkill
 
 import a2a_agent
 import gateway
+
+log = logging.getLogger("demo.ticketing")
 
 AGENT_ID = "ticketing-agent"
 _TICKETS: dict[str, dict] = {}
@@ -69,6 +72,7 @@ async def _triage(
     """Ask a model (as this agent, via Kong) to classify the issue."""
     messages = [{"role": "system", "content": _TRIAGE_SYSTEM}, *_forward(history)]
     messages.append({"role": "user", "content": f"Triage this support request: {summary}"})
+    log.info("triage via kong agent=%s user=%s traceparent=%s", AGENT_ID, user or "-", (traceparent or "")[:50] or "(none)")
     try:
         r = await gateway.chat(
             messages, agent_id=AGENT_ID, user=user, traceparent=traceparent,
@@ -76,7 +80,9 @@ async def _triage(
         return (r.choices[0].message.content or "").strip()
     except Exception as e:  # noqa: BLE001
         if isinstance(e, gateway.AuthorizationDenied) or "Blocked by Reva" in str(e):
+            log.warning("triage DENIED by Reva")
             raise
+        log.warning("triage failed: %s", str(e)[:160])
         return ""
 
 
@@ -90,6 +96,7 @@ async def handle(
 ) -> str:
     """Delegated task from the orchestrator. Opens a ticket and triages it."""
     del session_id  # reserved for future task continuity
+    log.info("a2a handle text_len=%d history=%d user=%s", len(text or ""), len(history or []), user or "-")
     lowered = text.lower()
 
     if "close" in lowered:

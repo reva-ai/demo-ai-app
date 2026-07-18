@@ -22,10 +22,13 @@ outcome of asking, not a crash.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Callable
 
 import gateway
+
+log = logging.getLogger("demo.agents")
 
 ORCHESTRATOR_ID = "billing-support-agent"
 
@@ -121,6 +124,7 @@ async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
     """
     server, tool = name.split("__", 1)
     emit({"type": "tool_call", "server": server, "tool": tool, "arguments": arguments})
+    log.info("orchestrator call %s/%s agent=%s", server, tool, agent_id or "-")
 
     if server in AGENT_SERVERS:
         request_text = arguments.get("request") if isinstance(arguments, dict) else None
@@ -132,11 +136,13 @@ async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
             )
         except Exception as e:  # noqa: BLE001
             if _is_denial(e):
+                log.warning("orchestrator DENIED a2a %s", server)
                 emit({"type": "denied", "server": server, "tool": tool})
                 return json.dumps(
                     {"error": "not_authorized",
                      "detail": f"Reva denied delegation to {server}. The agent was never invoked."}
                 )
+            log.warning("orchestrator a2a error %s: %s", server, str(e)[:120])
             emit({"type": "error", "server": server, "tool": tool, "text": str(e)[:120]})
             return json.dumps({"error": "agent_failed", "detail": str(e)[:200]})
         payload = _parse_agent_payload(reply)
@@ -151,11 +157,13 @@ async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
         )
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
+            log.warning("orchestrator DENIED tool %s/%s", server, tool)
             emit({"type": "denied", "server": server, "tool": tool})
             return json.dumps(
                 {"error": "not_authorized",
                  "detail": f"Reva denied {server}/{tool}. The tool did not run."}
             )
+        log.warning("orchestrator tool error %s/%s: %s", server, tool, str(e)[:120])
         emit({"type": "error", "server": server, "tool": tool, "text": str(e)[:120]})
         return json.dumps({"error": "tool_failed", "detail": str(e)[:200]})
     emit({"type": "allowed", "server": server, "tool": tool, "result": result})
@@ -328,6 +336,11 @@ async def orchestrate(
     """
     if traceparent:
         emit({"type": "trace", "traceparent": traceparent})
+    log.info(
+        "orchestrate start agent=%s user=%s model=%s session=%s traceparent=%s",
+        agent_id, user, model or gateway.LLM_MODEL, session_id or "-",
+        (traceparent or "")[:50] or "(none)",
+    )
 
     tools = await _available_tools(
         emit, servers, agent_id=agent_id, user=user, traceparent=traceparent,
