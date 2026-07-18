@@ -9,6 +9,8 @@ prior turns), so Reva evaluates with the same context the orchestrator had.
 This sub-agent is itself an agent: to triage a request it makes its OWN model
 call through Kong under identity `ticketing-agent`. That second call is a
 separate Reva evaluation — genuine, independently-governed agent-to-agent.
+It reuses any W3C `traceparent` Kong forwarded on the A2A request so nested
+model calls stay on the same trace; `context.hops` is maintained by Kong.
 
 Kong A2A route path segment must be `ticketing-agent` so the resource id matches.
 
@@ -18,6 +20,7 @@ Run:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from a2a.types import AgentSkill
@@ -34,6 +37,16 @@ _TRIAGE_SYSTEM = (
 )
 
 
+def _envelope(**fields: Any) -> str:
+    """Structured A2A reply the orchestrator can unpack for the model + UI trace.
+
+    Always includes `reply` (user-facing text). When this agent made its own
+    model call, also set `reasoned_by` or a denial `note` so the orchestrator
+    can emit a nested authorization card.
+    """
+    return json.dumps(fields, default=str)
+
+
 def _forward(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Prior turns the orchestrator forwarded → messages for our own model call.
 
@@ -46,12 +59,20 @@ def _forward(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-async def _triage(summary: str, history: list[dict[str, Any]], user: str | None) -> str:
+async def _triage(
+    summary: str,
+    history: list[dict[str, Any]],
+    user: str | None,
+    *,
+    traceparent: str | None,
+) -> str:
     """Ask a model (as this agent, via Kong) to classify the issue."""
     messages = [{"role": "system", "content": _TRIAGE_SYSTEM}, *_forward(history)]
     messages.append({"role": "user", "content": f"Triage this support request: {summary}"})
     try:
-        r = await gateway.chat(messages, agent_id=AGENT_ID, user=user)
+        r = await gateway.chat(
+            messages, agent_id=AGENT_ID, user=user, traceparent=traceparent,
+        )
         return (r.choices[0].message.content or "").strip()
     except Exception as e:  # noqa: BLE001
         if isinstance(e, gateway.AuthorizationDenied) or "Blocked by Reva" in str(e):
@@ -59,27 +80,50 @@ async def _triage(summary: str, history: list[dict[str, Any]], user: str | None)
         return ""
 
 
-async def handle(text: str, history: list[dict[str, Any]], user: str | None, session_id: str | None) -> str:
+async def handle(
+    text: str,
+    history: list[dict[str, Any]],
+    user: str | None,
+    session_id: str | None,
+    *,
+    traceparent: str | None = None,
+) -> str:
     """Delegated task from the orchestrator. Opens a ticket and triages it."""
+    del session_id  # reserved for future task continuity
     lowered = text.lower()
 
     if "close" in lowered:
         for tid in _TICKETS:
             if tid.lower() in lowered:
                 _TICKETS[tid]["status"] = "closed"
-                return f"Closed ticket {tid}."
-        return "No matching open ticket to close."
+                return _envelope(reply=f"Closed ticket {tid}.", ticket_id=tid, status="closed")
+        return _envelope(reply="No matching open ticket to close.")
 
     ticket_id = f"TKT-{1000 + len(_TICKETS)}"
     _TICKETS[ticket_id] = {"summary": text, "status": "open"}
     try:
-        triage = await _triage(text, history, user)
+        triage = await _triage(text, history, user, traceparent=traceparent)
     except gateway.AuthorizationDenied:
-        return (f"Opened ticket {ticket_id} (status: open), but I could not triage it — "
-                "my own model call was denied by Reva.")
+        return _envelope(
+            reply=(f"Opened ticket {ticket_id} (status: open), but I could not triage it — "
+                   "my own model call was denied by Reva."),
+            ticket_id=ticket_id,
+            status="open",
+            note=f"{AGENT_ID}'s own model call was DENIED by Reva — ticket opened without triage.",
+        )
     if triage:
-        return f"Opened ticket {ticket_id} (status: open). Triage: {triage}"
-    return f"Opened ticket {ticket_id} (status: open); triage unavailable right now."
+        return _envelope(
+            reply=f"Opened ticket {ticket_id} (status: open). Triage: {triage}",
+            ticket_id=ticket_id,
+            status="open",
+            triage=triage,
+            reasoned_by=f"{AGENT_ID} (own model call via Kong)",
+        )
+    return _envelope(
+        reply=f"Opened ticket {ticket_id} (status: open); triage unavailable right now.",
+        ticket_id=ticket_id,
+        status="open",
+    )
 
 
 SKILLS = [

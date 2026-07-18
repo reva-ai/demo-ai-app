@@ -1,16 +1,16 @@
 """Shared plumbing for exposing a sub-agent over the A2A protocol.
 
 Why A2A (and not MCP) for sub-agents: agent-to-agent delegation is a first-class
-concept in A2A. The orchestrator sends a standard `message/send` whose body
-carries the turn's text (the userQuery) and — in the message `metadata` — the
-running conversation (`chatHistory`) plus the acting user. Kong sits in front of
-each A2A route and reads that standard body to build the Reva PDP payload; no
-custom headers, no per-customer code.
+concept in A2A. The orchestrator sends a standard `message/send`; Kong fronts this
+route and asks Reva to authorize the `invokeAgent` before the message is delivered.
 
-Conversation forwarding is A2A-native:
-  - `metadata.chatHistory` : [{role, content}, …]  → context.chatHistory
-  - `contextId`            : stable thread id       → session.id
-  - message text parts     : the current turn       → userQuery
+Forwarding (A2A-native metadata + W3C header):
+  - `metadata.chatHistory` : [{role, content}, …]
+  - `metadata.traceparent` : same W3C trace (also on the HTTP `traceparent` header)
+  - `contextId`            : session.id
+  - message text parts     : current turn
+
+`context.hops` is built by Kong, not by this app.
 
 Each concrete agent supplies one async handler; everything else is boilerplate.
 """
@@ -29,17 +29,30 @@ from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 from a2a.utils import new_agent_text_message
 
-# handler(text, chat_history, user, session_id) -> reply text
-Handler = Callable[[str, list[dict[str, Any]], str | None, str | None], Awaitable[str]]
+# handler(text, history, user, session_id, *, traceparent) -> reply text
+Handler = Callable[..., Awaitable[str]]
+
+
+def _header_traceparent(context: RequestContext) -> str | None:
+    """Prefer the W3C HTTP header; fall back to A2A metadata."""
+    call = getattr(context, "call_context", None)
+    state = getattr(call, "state", None) or {}
+    headers = state.get("headers") if isinstance(state, dict) else None
+    if isinstance(headers, dict):
+        for key in ("traceparent", "Traceparent"):
+            if headers.get(key):
+                return headers[key]
+    for attr in ("headers", "metadata"):
+        blob = getattr(call, attr, None)
+        if isinstance(blob, dict):
+            for key in ("traceparent", "Traceparent"):
+                if blob.get(key):
+                    return blob[key]
+    return None
 
 
 class _HandlerExecutor(AgentExecutor):
-    """Adapts a plain async handler to the A2A executor interface.
-
-    It pulls the standard A2A conversation off the request — text parts for the
-    current turn, `metadata.chatHistory` for prior turns — and hands them to the
-    agent's own logic.
-    """
+    """Adapts a plain async handler to the A2A executor interface."""
 
     def __init__(self, handler: Handler) -> None:
         self._handler = handler
@@ -51,7 +64,14 @@ class _HandlerExecutor(AgentExecutor):
         if not isinstance(history, list):
             history = []
         user = meta.get("user")
-        reply = await self._handler(text, history, user, context.context_id)
+        traceparent = _header_traceparent(context) or meta.get("traceparent")
+        reply = await self._handler(
+            text,
+            history,
+            user,
+            context.context_id,
+            traceparent=traceparent,
+        )
         await event_queue.enqueue_event(new_agent_text_message(reply, context.context_id))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:

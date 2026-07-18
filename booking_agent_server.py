@@ -23,8 +23,16 @@ _SLOTS = ["2026-07-14T10:00Z", "2026-07-14T14:00Z", "2026-07-15T09:00Z"]
 _SLOT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z")
 
 
-async def handle(text: str, history: list[dict[str, Any]], user: str | None, session_id: str | None) -> str:
+async def handle(
+    text: str,
+    history: list[dict[str, Any]],
+    user: str | None,
+    session_id: str | None,
+    *,
+    traceparent: str | None = None,
+) -> str:
     """Delegated task from the orchestrator: list or book a callback slot."""
+    del history, user, session_id, traceparent  # no nested Kong calls
     lowered = text.lower()
     if "list" in lowered or "available" in lowered or "slot" in lowered and "book" not in lowered:
         return "Available callback slots: " + ", ".join(_SLOTS)

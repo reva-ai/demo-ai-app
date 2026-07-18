@@ -84,6 +84,7 @@ def _is_denial(err: Exception) -> bool:
 async def _available_tools(
     emit: Callable[[dict], None], servers: list[str] | None = None,
     *, agent_id: str | None = None, user: str | None = None,
+    traceparent: str | None = None,
 ) -> list[dict[str, Any]]:
     """Discover tools from each selected server. A server that is down is skipped
     rather than fatal — the demo should degrade, not collapse.
@@ -99,7 +100,9 @@ async def _available_tools(
             tools.append(_agent_function(server))
             continue
         try:
-            tools.extend(await gateway.list_tools(server, agent_id=agent_id, user=user))
+            tools.extend(await gateway.list_tools(
+                server, agent_id=agent_id, user=user, traceparent=traceparent,
+            ))
         except Exception as e:  # noqa: BLE001
             emit({"type": "warn", "text": f"{server} unreachable: {str(e)[:80]}"})
     return tools
@@ -108,7 +111,8 @@ async def _available_tools(
 async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
                     *, agent_id: str | None = None, user: str | None = None,
                     history: list[dict[str, Any]] | None = None,
-                    session_id: str | None = None) -> str:
+                    session_id: str | None = None,
+                    traceparent: str | None = None) -> str:
     """Execute one tool call and return what the model should see as its result.
 
     Sub-agents (AGENT_SERVERS) go over A2A: the conversation is forwarded as the
@@ -124,7 +128,7 @@ async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
         try:
             reply = await gateway.send_agent(
                 server, request_text, history=history, session_id=session_id,
-                agent_id=agent_id, user=user,
+                agent_id=agent_id, user=user, traceparent=traceparent,
             )
         except Exception as e:  # noqa: BLE001
             if _is_denial(e):
@@ -135,11 +139,16 @@ async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
                 )
             emit({"type": "error", "server": server, "tool": tool, "text": str(e)[:120]})
             return json.dumps({"error": "agent_failed", "detail": str(e)[:200]})
-        emit({"type": "allowed", "server": server, "tool": tool, "result": reply})
-        return json.dumps({"agent_reply": reply})
+        payload = _parse_agent_payload(reply)
+        emit({"type": "allowed", "server": server, "tool": tool, "result": payload})
+        _emit_nested_model(server, payload, emit)
+        return json.dumps(payload, default=str)
 
     try:
-        result = await gateway.call_tool(server, tool, arguments, agent_id=agent_id, user=user)
+        result = await gateway.call_tool(
+            server, tool, arguments, agent_id=agent_id, user=user,
+            traceparent=traceparent,
+        )
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
             emit({"type": "denied", "server": server, "tool": tool})
@@ -150,16 +159,36 @@ async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
         emit({"type": "error", "server": server, "tool": tool, "text": str(e)[:120]})
         return json.dumps({"error": "tool_failed", "detail": str(e)[:200]})
     emit({"type": "allowed", "server": server, "tool": tool, "result": result})
-    # If the tool was itself a reasoning agent, it made its OWN model call inside.
-    # Surface that nested authorization as its own trace card so the whole
-    # agent-to-agent chain is visible: two agents, each thinking, each governed.
     if isinstance(result, dict):
-        nested_model = gateway.LLM_MODEL
-        if result.get("reasoned_by"):
-            emit({"type": "allowed", "kind": "model", "server": server, "tool": nested_model})
-        elif "DENIED by Reva" in str(result.get("note", "")):
-            emit({"type": "denied", "kind": "model", "server": server, "tool": nested_model})
+        _emit_nested_model(server, result, emit)
     return json.dumps(result, default=str)
+
+
+def _parse_agent_payload(reply: str) -> dict[str, Any]:
+    """Normalize an A2A reply into a structured dict for the model / fallback.
+
+    Ticketing returns a JSON envelope with `reply` (+ optional reasoned_by/note).
+    Booking (and any plain-text agent) becomes {"reply": "<text>"}.
+    """
+    try:
+        data = json.loads(reply)
+    except (ValueError, TypeError):
+        data = None
+    if isinstance(data, dict) and (data.get("reply") is not None or data.get("reasoned_by")
+                                   or data.get("note") or data.get("error")):
+        if "reply" not in data and not data.get("error"):
+            data = {**data, "reply": reply}
+        return data
+    return {"reply": reply}
+
+
+def _emit_nested_model(server: str, payload: dict[str, Any], emit: Callable[[dict], None]) -> None:
+    """If a sub-agent made its own model call, surface that as a second trace card."""
+    nested_model = gateway.LLM_MODEL
+    if payload.get("reasoned_by"):
+        emit({"type": "allowed", "kind": "model", "server": server, "tool": nested_model})
+    elif "DENIED by Reva" in str(payload.get("note", "")):
+        emit({"type": "denied", "kind": "model", "server": server, "tool": nested_model})
 
 
 _THINK = re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE)
@@ -171,14 +200,18 @@ def _strip_thinking(text: str | None) -> str:
 
 
 def _phrase(name: str, result_json: str) -> str:
-    """Fallback user-facing text when we cannot ask the model to summarize."""
+    """Fallback user-facing text when we cannot ask the model to summarize.
+
+    Primary path: the model reads the structured tool/agent JSON and writes the
+    reply itself. This only runs for keyword-fallback / non-tool-capable models.
+    """
     server, tool = name.split("__", 1)
     try:
         data = json.loads(result_json)
     except (ValueError, TypeError):
         data = None
-    if isinstance(data, dict) and "agent_reply" in data:
-        return data["agent_reply"]
+    if isinstance(data, dict) and data.get("reply"):
+        return str(data["reply"])
     if isinstance(data, dict) and data.get("error") == "not_authorized":
         if server in AGENT_SERVERS:
             return (
@@ -194,6 +227,7 @@ def _phrase(name: str, result_json: str) -> str:
     if not isinstance(data, dict):
         return "I finished that request, but got an unexpected result back."
 
+    # MCP tool fixtures only — agents return {reply} above.
     cid = data.get("customerId") or data.get("customer_id")
     if tool == "get_billing_report":
         return (
@@ -213,12 +247,6 @@ def _phrase(name: str, result_json: str) -> str:
             f"• SSN: {data.get('ssn')}\n"
             f"• Date of birth: {data.get('dob')}"
         )
-    if tool == "create_ticket":
-        return f"I created support ticket {data.get('ticket_id') or data.get('id') or 'successfully'}."
-    if tool == "close_ticket":
-        return f"Ticket {data.get('ticket_id') or data.get('id') or ''} has been closed."
-    if tool in ("list_slots", "book_slot"):
-        return f"Booking update: {json.dumps(data, default=str)}"
     if tool == "analytics_probe":
         return f"Analytics probe result: {data.get('note') or json.dumps(data, default=str)}"
     return f"Done — I have the result for {tool}."
@@ -257,14 +285,17 @@ async def _run_fallback(
     message: str, servers: list[str] | None, emit: Callable[[dict], None],
     *, agent_id: str | None = None, user: str | None = None,
     history: list[dict[str, Any]] | None = None, session_id: str | None = None,
+    traceparent: str | None = None,
 ) -> str | None:
     """If the prompt maps to a tool, call it directly and phrase the outcome."""
     intent = _fallback_intent(message, servers)
     if not intent:
         return None
     server, tool, args = intent
-    result = await _run_tool(f"{server}__{tool}", args, emit, agent_id=agent_id, user=user,
-                             history=history, session_id=session_id)
+    result = await _run_tool(
+        f"{server}__{tool}", args, emit, agent_id=agent_id, user=user,
+        history=history, session_id=session_id, traceparent=traceparent,
+    )
     return _phrase(f"{server}__{tool}", result)
 
 
@@ -278,6 +309,7 @@ async def orchestrate(
     servers: list[str] | None = None,
     history: list[dict[str, Any]] | None = None,
     session_id: str | None = None,
+    traceparent: str | None = None,
     max_turns: int = 6,
 ) -> str:
     """Run the agent loop for one user message. `emit` streams trace events to the UI.
@@ -287,10 +319,19 @@ async def orchestrate(
     the same user, prompt, and model, under an identity no permit covers, gets
     refused. Reva evaluates the agent — not just the request.
 
+    `traceparent` is only forwarded when provided (ingress / prior Kong hop).
+    Kong generates one when the outbound request has none. Building
+    `context.hops` is also Kong's job.
+
     max_turns bounds the loop: a model that keeps calling denied tools would
     otherwise retry forever, and each retry is a real authorization request.
     """
-    tools = await _available_tools(emit, servers, agent_id=agent_id, user=user)
+    if traceparent:
+        emit({"type": "trace", "traceparent": traceparent})
+
+    tools = await _available_tools(
+        emit, servers, agent_id=agent_id, user=user, traceparent=traceparent,
+    )
     used_model = model or gateway.LLM_MODEL
     # Withhold tools from models that can't do OpenAI-style tool-calling reliably
     # (e.g. Nova). The keyword→tool fallback still runs tools through Kong/Reva.
@@ -308,11 +349,18 @@ async def orchestrate(
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM}, *convo]
 
+    async def _llm() -> Any:
+        return await gateway.chat(
+            messages, agent_id=agent_id, tools=send_tools or None, user=user, model=model,
+            traceparent=traceparent,
+        )
+
     # Models that can't tool-call (e.g. Nova): one LLM attempt, then keyword fallback.
     if not tool_capable:
         try:
             response = await gateway.chat(
-                messages, agent_id=agent_id, tools=None, user=user, model=model
+                messages, agent_id=agent_id, tools=None, user=user, model=model,
+                traceparent=traceparent,
             )
         except Exception as e:  # noqa: BLE001
             if _is_denial(e):
@@ -322,12 +370,16 @@ async def orchestrate(
                     "The model was never contacted."
                 )
             emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
-            fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
-                                 history=convo, session_id=session_id)
+            fb = await _run_fallback(
+                message, servers, emit, agent_id=agent_id, user=user,
+                history=convo, session_id=session_id, traceparent=traceparent,
+            )
             return fb if fb is not None else f"The model call failed: {str(e)[:160]}"
         emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
-        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
-                                 history=convo, session_id=session_id)
+        fb = await _run_fallback(
+            message, servers, emit, agent_id=agent_id, user=user,
+            history=convo, session_id=session_id, traceparent=traceparent,
+        )
         if fb is not None:
             return fb
         return _strip_thinking(response.choices[0].message.content) or "…"
@@ -335,9 +387,7 @@ async def orchestrate(
     # Tool-capable path: run tools, then ask the model to write a natural reply.
     for turn in range(max_turns):
         try:
-            response = await gateway.chat(
-                messages, agent_id=agent_id, tools=send_tools or None, user=user, model=model
-            )
+            response = await _llm()
         except Exception as e:  # noqa: BLE001
             if _is_denial(e):
                 emit({"type": "denied", "kind": "model", "server": agent_id, "tool": used_model})
@@ -347,8 +397,10 @@ async def orchestrate(
                 )
             emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
             if turn == 0:
-                fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
-                                 history=convo, session_id=session_id)
+                fb = await _run_fallback(
+                    message, servers, emit, agent_id=agent_id, user=user,
+                    history=convo, session_id=session_id, traceparent=traceparent,
+                )
                 if fb is not None:
                     return fb
             if "ToolUse" in str(e) or "424" in str(e):
@@ -364,8 +416,10 @@ async def orchestrate(
             text = _strip_thinking(choice.content)
             if turn == 0:
                 # Prefer a real tool hop when intent is clear so Reva still demos.
-                fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
-                                 history=convo, session_id=session_id)
+                fb = await _run_fallback(
+                    message, servers, emit, agent_id=agent_id, user=user,
+                    history=convo, session_id=session_id, traceparent=traceparent,
+                )
                 if fb is not None:
                     return fb
             return text or "…"
@@ -394,6 +448,7 @@ async def orchestrate(
                 user=user,
                 history=convo,
                 session_id=session_id,
+                traceparent=traceparent,
             )
             messages.append({
                 "role": "tool",
