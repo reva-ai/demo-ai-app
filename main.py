@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -47,8 +47,14 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest) -> StreamingResponse:
-    """Server-sent events: trace events as they happen, then the final reply."""
+async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
+    """Server-sent events: trace events as they happen, then the final reply.
+
+    If an ingress gateway already set `traceparent`, we forward it on every Kong
+    hop. We never mint one here — that's Kong's job when the header is absent.
+    """
+    # W3C Trace Context is a header, not a body field.
+    traceparent = request.headers.get("traceparent")
     queue: asyncio.Queue = asyncio.Queue()
 
     async def run() -> None:
@@ -56,7 +62,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             reply = await agents.orchestrate(
                 req.message, user=req.user, agent_id=req.agent_id,
                 model=req.model, servers=req.servers, history=req.history,
-                session_id=req.session_id, emit=queue.put_nowait,
+                session_id=req.session_id, traceparent=traceparent,
+                emit=queue.put_nowait,
             )
             queue.put_nowait({"type": "reply", "text": reply})
         except Exception as e:  # noqa: BLE001

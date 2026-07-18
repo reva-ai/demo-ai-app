@@ -2,7 +2,13 @@
 
 Nothing here talks to an LLM provider or an MCP server directly. Both go
 through cloud-hosted Kong routes; Kong's custom plugin calls Reva PDP before
-proxying. Identity for that plugin rides in X-Reva-Agent-Id / X-Reva-User.
+proxying.
+
+Identity for that plugin rides in X-Reva-Agent-Id / X-Reva-User.
+
+`traceparent` (W3C Trace Context): this app only *forwards* it when already
+present (e.g. from an ingress gateway or from Kong on a nested A2A hop). Kong
+generates one when the inbound request has none — that is the gateway's job.
 
 Deny contract: Kong should respond HTTP 403 with a body/message containing
 "Blocked by Reva". Callers treat that as a soft denial, not a crash.
@@ -64,12 +70,20 @@ def _require_a2a_url() -> str:
     return KONG_A2A_URL
 
 
-def _identity_headers(*, agent_id: str | None = None, user: str | None = None) -> dict[str, str]:
+def _kong_headers(
+    *,
+    agent_id: str | None = None,
+    user: str | None = None,
+    traceparent: str | None = None,
+) -> dict[str, str]:
     headers: dict[str, str] = {}
     if agent_id:
         headers["X-Reva-Agent-Id"] = agent_id
     if user:
         headers["X-Reva-User"] = user
+    # Only forward — never mint. Missing → Kong generates.
+    if traceparent:
+        headers["traceparent"] = traceparent
     return headers
 
 
@@ -88,16 +102,19 @@ async def chat(
     tools: list[dict[str, Any]] | None = None,
     user: str | None = None,
     model: str | None = None,
+    traceparent: str | None = None,
 ) -> Any:
     """One LLM turn, routed through Kong.
 
-    `agent_id` and `user` become X-Reva-* headers for the Kong plugin to map
-    into a Reva PDP evaluation before the request reaches the upstream model.
+    `agent_id` / `user` → identity headers. `traceparent` is forwarded when the
+    caller already has one; otherwise Kong mints it on the gateway.
     """
     client = AsyncOpenAI(
         api_key=_require_key(),
         base_url=_require_llm_url(),
-        default_headers=_identity_headers(agent_id=agent_id, user=user),
+        default_headers=_kong_headers(
+            agent_id=agent_id, user=user, traceparent=traceparent
+        ),
     )
     kwargs: dict[str, Any] = {"model": model or LLM_MODEL, "messages": messages}
     if tools:
@@ -112,10 +129,16 @@ async def chat(
         raise
 
 
-def _mcp_client(server: str, *, agent_id: str | None = None, user: str | None = None) -> Client:
+def _mcp_client(
+    server: str,
+    *,
+    agent_id: str | None = None,
+    user: str | None = None,
+    traceparent: str | None = None,
+) -> Client:
     headers = {
         "Authorization": f"Bearer {_require_key()}",
-        **_identity_headers(agent_id=agent_id, user=user),
+        **_kong_headers(agent_id=agent_id, user=user, traceparent=traceparent),
     }
     return Client(
         StreamableHttpTransport(
@@ -125,7 +148,13 @@ def _mcp_client(server: str, *, agent_id: str | None = None, user: str | None = 
     )
 
 
-async def list_tools(server: str, *, agent_id: str | None = None, user: str | None = None) -> list[dict[str, Any]]:
+async def list_tools(
+    server: str,
+    *,
+    agent_id: str | None = None,
+    user: str | None = None,
+    traceparent: str | None = None,
+) -> list[dict[str, Any]]:
     """Discover an MCP server's tools via Kong, shaped for the OpenAI tools param.
 
     Tool names are prefixed with the server so the orchestrator can route a
@@ -134,7 +163,9 @@ async def list_tools(server: str, *, agent_id: str | None = None, user: str | No
     typically use, so the two conventions are translated at this boundary.
     """
     try:
-        async with _mcp_client(server, agent_id=agent_id, user=user) as c:
+        async with _mcp_client(
+            server, agent_id=agent_id, user=user, traceparent=traceparent
+        ) as c:
             return [
                 {
                     "type": "function",
@@ -151,15 +182,24 @@ async def list_tools(server: str, *, agent_id: str | None = None, user: str | No
         raise
 
 
-async def call_tool(server: str, tool: str, arguments: dict[str, Any],
-                    *, agent_id: str | None = None, user: str | None = None) -> Any:
+async def call_tool(
+    server: str,
+    tool: str,
+    arguments: dict[str, Any],
+    *,
+    agent_id: str | None = None,
+    user: str | None = None,
+    traceparent: str | None = None,
+) -> Any:
     """Invoke one MCP tool through Kong.
 
     A Reva denial surfaces as AuthorizationDenied — the tool's code never runs.
     Callers should catch it and tell the user they were not authorized.
     """
     try:
-        async with _mcp_client(server, agent_id=agent_id, user=user) as c:
+        async with _mcp_client(
+            server, agent_id=agent_id, user=user, traceparent=traceparent
+        ) as c:
             result = await c.call_tool(tool, arguments)
             return result.structured_content or result.content
     except AuthorizationDenied:
@@ -189,16 +229,21 @@ def _extract_a2a_text(resp: Any) -> str:
     return str(result)
 
 
-async def send_agent(agent: str, text: str, *,
-                     history: list[dict[str, Any]] | None = None,
-                     session_id: str | None = None,
-                     agent_id: str | None = None, user: str | None = None) -> str:
+async def send_agent(
+    agent: str,
+    text: str,
+    *,
+    history: list[dict[str, Any]] | None = None,
+    session_id: str | None = None,
+    agent_id: str | None = None,
+    user: str | None = None,
+    traceparent: str | None = None,
+) -> str:
     """Delegate to a sub-agent via A2A `message/send`, routed through Kong.
 
-    The conversation travels the A2A-native way: the current turn as the message
-    text, prior turns in `metadata.chatHistory`, and the thread as `contextId`.
-    Kong reads that standard body to authorize the `invokeAgent` with Reva; a
-    denial comes back as HTTP 403 and surfaces here as AuthorizationDenied.
+    Conversation travels A2A-natively (text + metadata.chatHistory + contextId).
+    If `traceparent` is already known, it is forwarded so Kong keeps the same
+    trace; if absent, Kong generates one and should forward it upstream.
     """
     url = f"{_require_a2a_url()}/{agent}"
     message = Message(
@@ -206,10 +251,17 @@ async def send_agent(agent: str, text: str, *,
         role=Role.user,
         parts=[Part(root=TextPart(text=text))],
         context_id=session_id,
-        metadata={"chatHistory": history or [], "user": user},
+        metadata={
+            "chatHistory": history or [],
+            "user": user,
+            "traceparent": traceparent,
+        },
     )
     request = SendMessageRequest(id=str(uuid.uuid4()), params=MessageSendParams(message=message))
-    headers = {"Authorization": f"Bearer {_require_key()}", **_identity_headers(agent_id=agent_id, user=user)}
+    headers = {
+        "Authorization": f"Bearer {_require_key()}",
+        **_kong_headers(agent_id=agent_id, user=user, traceparent=traceparent),
+    }
     try:
         async with httpx.AsyncClient(headers=headers, timeout=90.0) as hc:
             client = A2AClient(httpx_client=hc, url=url)

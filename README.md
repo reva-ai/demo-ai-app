@@ -75,22 +75,39 @@ because it makes its own model call under identity `ticketing-agent`.
 ## Kong plugin contract
 
 Configure routes on Kong Cloud so the agent can reach LLM, MCP, and A2A through
-them. This app sends only **identity** headers on every hop (never conversation):
+them.
+
+### Headers on every hop
 
 | Header | Example | Meaning |
 |--------|---------|---------|
 | `Authorization` | `Bearer <KONG_API_KEY>` | Kong consumer / key-auth |
 | `X-Reva-Agent-Id` | `billing-support-agent` | Acting agent (subject) |
 | `X-Reva-User` | `alice@analyst` | On-behalf-of user (principal) |
+| `traceparent` | `00-<trace>-<span>-01` | W3C Trace Context — **forwarded if present** |
 
-The **conversation** is read by Kong from the standard request body — no custom
-headers:
+**`traceparent`:** the app never mints this. It only forwards an existing header
+(from an ingress gateway on `/chat`, or from Kong on a nested A2A hop). Kong must:
 
-| Hop | userQuery | chatHistory | session.id |
-|-----|-----------|-------------|------------|
-| LLM (`/llm`) | last `user` message | OpenAI `messages[]` | request id |
-| MCP tool (`/mcp/*`) | tool arguments | — | `mcp-session-id` |
-| A2A agent (`/a2a/*`) | message text `parts[]` | `message.metadata.chatHistory` | `message.contextId` |
+1. **Generate** a `traceparent` when the inbound request has none.
+2. Copy it onto the PDP callout.
+3. **Forward it upstream** (LLM / MCP / A2A) so nested agents can continue the
+   same trace on their own Kong calls.
+4. Use it as the key to accumulate `context.hops` (also Kong's job).
+
+If the browser hits the app with no ingress `traceparent`, the first Kong hop
+creates one; later hops in the same turn stay correlated if Kong forwards that
+value upstream (and/or echoes it so the client can reuse it).
+
+### Conversation (from the request body)
+
+| Field | LLM (`/llm`) | MCP (`/mcp/*`) | A2A (`/a2a/*`) |
+|-------|--------------|----------------|----------------|
+| `transmission.content` / prompt | last user message | tool args | message `parts[].text` |
+| `context.conversation.messages` | from OpenAI `messages[]` | — | from `metadata.chatHistory` |
+| `context.hops` | **Kong-maintained** (keyed by `traceparent`) | same | same |
+| `inputValues` | — | `params.arguments` | — |
+| `session.id` | request id | `mcp-session-id` | `message.contextId` |
 
 Path layout (segments must match `agents.TOOL_SERVERS` / `agents.AGENT_SERVERS`):
 
@@ -105,9 +122,9 @@ Path layout (segments must match `agents.TOOL_SERVERS` / `agents.AGENT_SERVERS`)
 The orchestrator treats that as a soft denial (explains to the user) instead of
 crashing.
 
-Map identity headers + standard request body into your Reva PDP evals in the Kong
-plugin (invokeModel / invokeTool / invokeAgent). Policy store and Cedar schemas
-are unchanged by this app.
+Map identity headers + body into the Reva PDP eval (invokeModel / invokeTool /
+invokeAgent). Maintain `context.hops` in the plugin using `traceparent` as the
+correlation key. Update `policyStoreId` to your store.
 
 ## Demo agents & tools
 
