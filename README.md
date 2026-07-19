@@ -86,18 +86,16 @@ them.
 | `X-Reva-User` | `alice@analyst` | On-behalf-of user (principal) |
 | `traceparent` | `00-<trace>-<span>-01` | W3C Trace Context — **forwarded if present** |
 
-**`traceparent`:** the app never mints this. It only forwards an existing header
-(from an ingress gateway on `/chat`, or from Kong on a nested A2A hop). Kong must:
+**`traceparent`:** the orchestrator mints one per chat turn when ingress has
+none, and sends it on every Kong hop (LLM / MCP / A2A) so PDP sees one shared
+trace. If `/chat` already has `traceparent`, that value is reused. Kong must:
 
-1. **Generate** a `traceparent` when the inbound request has none.
+1. **Prefer** the inbound `traceparent` (do not mint a new one when present).
 2. Copy it onto the PDP callout.
-3. **Forward it upstream** (LLM / MCP / A2A) so nested agents can continue the
-   same trace on their own Kong calls.
+3. **Forward it upstream** (LLM / MCP / A2A) so nested agents continue the same
+   trace on their own Kong calls.
 4. Use it as the key to accumulate `context.hops` (also Kong's job).
-
-If the browser hits the app with no ingress `traceparent`, the first Kong hop
-creates one; later hops in the same turn stay correlated if Kong forwards that
-value upstream (and/or echoes it so the client can reuse it).
+5. **Generate** only when a hop truly has no `traceparent`.
 
 ### Conversation (from the request body)
 
