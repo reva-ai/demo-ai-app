@@ -57,13 +57,14 @@ class ChatRequest(BaseModel):
 async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     """Server-sent events: trace events as they happen, then the final reply.
 
-    If an ingress gateway already set `traceparent`, we forward it on every Kong
-    hop. We never mint one here — that's Kong's job when the header is absent.
+    Ingress `traceparent` is forwarded when present. If absent, the orchestrator
+    mints one for the turn and sends it on every Kong hop.
     """
     # W3C Trace Context is a header, not a body field.
     traceparent = request.headers.get("traceparent")
     log.info(
-        "chat start agent=%s user=%s model=%s session=%s traceparent=%s msg_len=%d history=%d",
+        "chat start agent=%s user=%s model=%s session=%s ingress_traceparent=%s "
+        "msg_len=%d history=%d",
         req.agent_id, req.user, req.model or "(default)", req.session_id or "-",
         traceparent or "(none)", len(req.message or ""), len(req.history or []),
     )

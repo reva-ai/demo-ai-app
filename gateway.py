@@ -6,9 +6,10 @@ proxying.
 
 Identity for that plugin rides in X-Reva-Agent-Id / X-Reva-User.
 
-`traceparent` (W3C Trace Context): this app only *forwards* it when already
-present (e.g. from an ingress gateway or from Kong on a nested A2A hop). Kong
-generates one when the inbound request has none — that is the gateway's job.
+`traceparent` (W3C Trace Context): minted once per chat turn in the app (or
+forwarded from ingress / a nested Kong hop) and sent on every Kong call so all
+PDP evals in that turn share one trace. Kong still mints only if a hop arrives
+with none.
 
 Deny contract: Kong should respond HTTP 403 with a body/message containing
 "Blocked by Reva". Callers treat that as a soft denial, not a crash.
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import uuid
 from typing import Any
 
@@ -51,6 +53,13 @@ class AuthorizationDenied(Exception):
 
 def _tp(traceparent: str | None) -> str:
     return (traceparent or "")[:50] or "(none)"
+
+
+def mint_traceparent() -> str:
+    """W3C traceparent: 00-<32 hex trace id>-<16 hex span id>-01."""
+    trace_id = secrets.token_hex(16)
+    span_id = secrets.token_hex(8)
+    return f"00-{trace_id}-{span_id}-01"
 
 
 def _require_key() -> str:
@@ -88,7 +97,6 @@ def _kong_headers(
         headers["X-Reva-Agent-Id"] = agent_id
     if user:
         headers["X-Reva-User"] = user
-    # Only forward — never mint. Missing → Kong generates.
     if traceparent:
         headers["traceparent"] = traceparent
     return headers
@@ -113,8 +121,8 @@ async def chat(
 ) -> Any:
     """One LLM turn, routed through Kong.
 
-    `agent_id` / `user` → identity headers. `traceparent` is forwarded when the
-    caller already has one; otherwise Kong mints it on the gateway.
+    `agent_id` / `user` → identity headers. Pass the turn's `traceparent` so
+    Kong/PDP see the same trace as sibling MCP/A2A hops.
     """
     used = model or LLM_MODEL
     log.info(

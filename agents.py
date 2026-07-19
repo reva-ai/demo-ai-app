@@ -327,15 +327,16 @@ async def orchestrate(
     the same user, prompt, and model, under an identity no permit covers, gets
     refused. Reva evaluates the agent — not just the request.
 
-    `traceparent` is only forwarded when provided (ingress / prior Kong hop).
-    Kong generates one when the outbound request has none. Building
-    `context.hops` is also Kong's job.
+    `traceparent`: reuse ingress if present; otherwise mint once for this turn
+    and send it on every Kong hop so PDP sees one shared trace. Kong still
+    mints only when a hop has none. `context.hops` remains Kong's job.
 
     max_turns bounds the loop: a model that keeps calling denied tools would
     otherwise retry forever, and each retry is a real authorization request.
     """
-    if traceparent:
-        emit({"type": "trace", "traceparent": traceparent})
+    if not traceparent:
+        traceparent = gateway.mint_traceparent()
+    emit({"type": "trace", "traceparent": traceparent})
     log.info(
         "orchestrate start agent=%s user=%s model=%s session=%s traceparent=%s",
         agent_id, user, model or gateway.LLM_MODEL, session_id or "-",
