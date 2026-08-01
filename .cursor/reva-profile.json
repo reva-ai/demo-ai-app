@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "profileKind": "repository-local",
+  "repository": "development/demo-ai-app",
+  "generatorVersion": "1.0.0",
+  "standardsSource": "KarthikRamesh/reva-standards",
+  "standardsRevision": "740fdff52ba1d093d36652347f64850c51ce9700",
+  "standardsReleaseStatus": "draft-task-authorized",
+  "ruleFormat": "flat-mdc-compatibility",
+  "adoptionMode": "progressive-non-breaking",
+  "selectedProfiles": [
+    "reva-org",
+    "reva-python",
+    "reva-fastapi",
+    "reva-agentic",
+    "reva-gitlab"
+  ],
+  "coveragePolicy": {
+    "changedExecutableCodeTargetPercent": 95,
+    "existingRepositoryAndCiGatesRemainAuthoritative": true,
+    "declarativeAssetsUseBehaviorCoverage": true
+  }
+}

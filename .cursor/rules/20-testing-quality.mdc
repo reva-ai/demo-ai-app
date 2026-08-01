@@ -1,0 +1,17 @@
+---
+description: Testing and 95% changed-code adoption guidance.
+globs: "{**/*test*,**/*Test*,**/tests/**,**/test/**,**/pyproject.toml}"
+alwaysApply: false
+---
+
+# Testing and quality
+
+- Every behavior change includes direct tests; every fix includes a regression test.
+- Structure tests as Arrange-Act-Assert or Given-When-Then with deterministic names and data.
+- Target at least 95% line/statement coverage for new or materially changed
+  executable production code where coverage tooling exists.
+- Preserve current repository and CI gates; report actual thresholds, results, and gaps instead
+  of claiming that this rule enforces coverage.
+- Test success, validation, authorization, tenant isolation, error, timeout, cancellation,
+  retry, idempotency, and safe fallback behavior as applicable.
+- Declarative assets use build-failing behavior matrices, not source-line percentages.

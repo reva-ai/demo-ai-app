@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "standardsRevision": "740fdff52ba1d093d36652347f64850c51ce9700",
+  "selectedProfiles": [
+    "reva-org",
+    "reva-python",
+    "reva-fastapi",
+    "reva-agentic",
+    "reva-gitlab"
+  ],
+  "exceptions": [
+    "95% changed-executable-code adoption target without rewriting existing build or CI thresholds",
+    "indexed and digest-bound nested .cursor module overlays"
+  ],
+  "snapshots": [
+    {
+      "kind": "organization-knowledge",
+      "profile": "reva-org",
+      "source": ".cursor/knowledge/context-budget.md",
+      "target": "knowledge/standards/context-budget.md",
+      "sourceSha256": "d9141fd5ce022f21b16fb10dfa7c1c0ba1e37e071fd302637726e9a0fdef07ad",
+      "materializedSha256": "cb0cd525838655d29387e97ec93f7251f298b5432f32d90e6da156537e38b586"
+    },
+    {
+      "kind": "baseline",
+      "profile": "reva-org",
+      "source": "cursor-baseline.md",
+      "target": "knowledge/standards/cursor-baseline.md",
+      "sourceSha256": "9c7f24e754eb6a71d2d4d229c61b9e06caf22c067abebf51db2a1b085dcb3acf",
+      "materializedSha256": "5244c7f3f9c922807daf39fe408b4d984ce3da651a9e599067f2fc369bf23e14"
+    },
+    {
+      "kind": "organization-knowledge",
+      "profile": "reva-org",
+      "source": ".cursor/knowledge/cursor-operating-model.md",
+      "target": "knowledge/standards/cursor-operating-model.md",
+      "sourceSha256": "86614537a4372f0c6986e21764d3d0bffc29895f399f457e954ede93b08d4acc",
+      "materializedSha256": "fd029630445b5abbec9a718c428d824aeba303d9ce7f49687b173d4d2656da95"
+    },
+    {
+      "kind": "baseline",
+      "profile": "reva-fastapi",
+      "source": "Python/FastAPI/baseline.md",
+      "target": "knowledge/standards/fastapi-baseline.md",
+      "sourceSha256": "ba6ee41f789a23de3bb5495fff1f2f140b8e0b895459515353c7895ff01cf9a6",
+      "materializedSha256": "5a8b422688f9ed3863b66ea0bc59c42a65e2b5d8079b628ce6ed651968d0bdf8"
+    },
+    {
+      "kind": "baseline",
+      "profile": "reva-gitlab",
+      "source": "GitLab/baseline.md",
+      "target": "knowledge/standards/gitlab-baseline.md",
+      "sourceSha256": "72104edd8974b567c918403eb5df719eecdba69384cad5c558d4e7dffd3394ab",
+      "materializedSha256": "ba41008b31a9a49c0c399af328c6f5dbe143c27b9a80451a72122f49adb711e4"
+    },
+    {
+      "kind": "organization-knowledge",
+      "profile": "reva-org",
+      "source": ".cursor/knowledge/hard-enforcement.md",
+      "target": "knowledge/standards/hard-enforcement.md",
+      "sourceSha256": "7b30288261f2f954b03e4d2bac12dcebdbe670d572a33ea6b227676f2c23a00f",
+      "materializedSha256": "ed750f554c1a503c68e5ec2c91ea677728b24f10767aebbda52c28a2005c6868"
+    },
+    {
+      "kind": "baseline",
+      "profile": "reva-org",
+      "source": "baseline.md",
+      "target": "knowledge/standards/organization-baseline.md",
+      "sourceSha256": "95f82f9b1af0e416c1e2c4b79f300bfe999658dffea618d15495fa3cc76fe30e",
+      "materializedSha256": "e35eeb28519a838c5a0aa99d8bcfcc99bcc9bd86a227fd61d4e65b6eee1737c4"
+    },
+    {
+      "kind": "baseline",
+      "profile": "reva-python",
+      "source": "Python/baseline.md",
+      "target": "knowledge/standards/python-baseline.md",
+      "sourceSha256": "b74dde0c35b751b4e2d4405fe7958a770dffc2f4ac201ca35935ac9ff1efc96a",
+      "materializedSha256": "b167dc44bc54ff2638766038da7a1bbc89efe645a143edb9a5de4b0d249c43e4"
+    },
+    {
+      "kind": "organization-knowledge",
+      "profile": "reva-org",
+      "source": ".cursor/knowledge/reva-architecture.md",
+      "target": "knowledge/standards/reva-architecture.md",
+      "sourceSha256": "892d0939303dac14fb21ac7d408d83c5279db3c993ee6b0218d23a518c68e245",
+      "materializedSha256": "13ba5ef73c14d3a31378979a35f60e435e71558cd037b8e1f9fc95dd69d81940"
+    }
+  ]
+}

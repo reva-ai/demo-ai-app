@@ -1,0 +1,13 @@
+---
+description: Python typing, async, package, testing, and shared-utility conventions.
+globs: "{**/*.py,**/pyproject.toml,**/requirements*.txt,**/setup.py}"
+alwaysApply: false
+---
+
+# Python engineering
+
+- Use the repository's pinned Python environment and dependency workflow. Keep complete typing,
+  small capability modules, explicit dependency injection, and deterministic import behavior.
+- Reuse `reva_utility`, `@Restrict`, `AccessDeniedException`, encryption, and logging setup.
+- Keep async paths non-blocking and cancellation-aware; isolate unavoidable sync libraries.
+- Use loguru/approved structured logging, pytest, configured type checks, Ruff, and coverage.

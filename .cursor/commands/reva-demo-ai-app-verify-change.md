@@ -1,0 +1,1 @@
+Review the current diff for Reva compatibility, security, tenancy, secrets, observability, module boundaries, tests, 95% changed-code evidence, and configured gates. Run safe checks and report exact results and gaps.

@@ -1,0 +1,1 @@
+Plan this change using AGENTS.md, repository-profile.md, the nearest module profile, tracked contracts, source, tests, and CI. State exact scope, risks, tests, 95% changed-code evidence, verification, and rollback.

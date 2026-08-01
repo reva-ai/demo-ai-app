@@ -1,0 +1,11 @@
+---
+description: FastAPI application, dependency, schema, and async conventions.
+globs: "{**/*.py,**/pyproject.toml,**/requirements*.txt}"
+alwaysApply: false
+---
+
+# FastAPI
+
+- Use an application factory/lifespan for resources; keep routers thin and domain code independent of request objects.
+- Validate schemas, preserve OpenAPI compatibility, centralize safe errors, and apply approved Restrict authorization.
+- Test routes, dependencies, lifespan, allow/deny/failure, validation, cancellation, and downstream timeouts.
