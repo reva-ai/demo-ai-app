@@ -11,3 +11,13 @@ venv/
 findings/
 **/.cursor/
 **/findings/
+
+# Ignore centralized AI rules, ignore files, and agents documentation
+.cursorignore
+.cursorindexingignore
+AGENTS.md
+agents.md
+**/.cursorignore
+**/.cursorindexingignore
+**/AGENTS.md
+**/agents.md
