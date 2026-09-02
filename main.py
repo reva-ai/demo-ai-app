@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +19,19 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-import agents
-
 load_dotenv(Path(__file__).with_name(".env"))
 
+# Permanently on: DEBUG by default (LOG_LEVEL can still override), and
+# OPENAI_LOG defaults to debug too, set before `import agents` pulls in
+# gateway.py's `from openai import AsyncOpenAI` so the SDK's own logger
+# picks it up. Together these show the raw request/response behind a
+# truncated error like gateway.py's `str(e)[:160]`.
+os.environ.setdefault("OPENAI_LOG", "debug")
+
+import agents  # noqa: E402 — after the OPENAI_LOG default above, on purpose
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "DEBUG").upper(),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 log = logging.getLogger("demo.main")
