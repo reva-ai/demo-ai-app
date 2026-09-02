@@ -12,7 +12,7 @@ separate Reva evaluation — genuine, independently-governed agent-to-agent.
 It reuses any W3C `traceparent` Kong forwarded on the A2A request so nested
 model calls stay on the same trace; `context.hops` is maintained by Kong.
 
-Kong A2A route path segment must be `ticketing-agent` so the resource id matches.
+The Kong Service URL (host + path) is the Agent resource id Reva evaluates.
 
 Run:
     .venv/bin/python ticketing_agent_server.py       # http://127.0.0.1:8003/
@@ -68,6 +68,7 @@ async def _triage(
     user: str | None,
     *,
     traceparent: str | None,
+    session_id: str | None = None,
 ) -> str:
     """Ask a model (as this agent, via Kong) to classify the issue."""
     messages = [{"role": "system", "content": _TRIAGE_SYSTEM}, *_forward(history)]
@@ -76,6 +77,7 @@ async def _triage(
     try:
         r = await gateway.chat(
             messages, agent_id=AGENT_ID, user=user, traceparent=traceparent,
+            session_id=session_id,
         )
         return (r.choices[0].message.content or "").strip()
     except Exception as e:  # noqa: BLE001
@@ -95,7 +97,6 @@ async def handle(
     traceparent: str | None = None,
 ) -> str:
     """Delegated task from the orchestrator. Opens a ticket and triages it."""
-    del session_id  # reserved for future task continuity
     log.info("a2a handle text_len=%d history=%d user=%s", len(text or ""), len(history or []), user or "-")
     lowered = text.lower()
 
@@ -109,7 +110,8 @@ async def handle(
     ticket_id = f"TKT-{1000 + len(_TICKETS)}"
     _TICKETS[ticket_id] = {"summary": text, "status": "open"}
     try:
-        triage = await _triage(text, history, user, traceparent=traceparent)
+        triage = await _triage(text, history, user, traceparent=traceparent,
+                               session_id=session_id)
     except gateway.AuthorizationDenied:
         return _envelope(
             reply=(f"Opened ticket {ticket_id} (status: open), but I could not triage it — "

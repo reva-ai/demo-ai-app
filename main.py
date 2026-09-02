@@ -2,7 +2,7 @@
 
 Serves the chat UI and orchestrator. Every LLM and MCP hop the orchestrator
 makes goes through cloud-hosted Kong (see gateway.py); Kong's plugin calls
-Reva PDP for allow/deny. This process never talks to Reva directly.
+Reva Trust Gateway for allow/deny. This process never talks to Reva directly.
 """
 
 from __future__ import annotations
@@ -36,6 +36,17 @@ app = FastAPI(title="Reva Kong Agentic Demo", version="0.2.0")
 @app.get("/")
 async def index() -> FileResponse:
     """Chat UI — the front door for the demo."""
+    return FileResponse(_STATIC / "index.html")
+
+
+@app.get("/ui")
+async def index_alias() -> FileResponse:
+    """Same page under a second path.
+
+    Render's free tier fronts the service with a hibernation proxy that
+    answers "/" itself, so the request never reaches this app and the UI
+    appears to 404. Any other path passes through untouched.
+    """
     return FileResponse(_STATIC / "index.html")
 
 

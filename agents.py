@@ -153,7 +153,7 @@ async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
     try:
         result = await gateway.call_tool(
             server, tool, arguments, agent_id=agent_id, user=user,
-            traceparent=traceparent,
+            traceparent=traceparent, session_id=session_id, history=history,
         )
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
@@ -328,7 +328,7 @@ async def orchestrate(
     refused. Reva evaluates the agent — not just the request.
 
     `traceparent`: reuse ingress if present; otherwise mint once for this turn
-    and send it on every Kong hop so PDP sees one shared trace. Kong still
+    and send it on every Kong hop so RTG sees one shared trace. Kong still
     mints only when a hop has none. `context.hops` remains Kong's job.
 
     max_turns bounds the loop: a model that keeps calling denied tools would
@@ -366,7 +366,7 @@ async def orchestrate(
     async def _llm() -> Any:
         return await gateway.chat(
             messages, agent_id=agent_id, tools=send_tools or None, user=user, model=model,
-            traceparent=traceparent,
+            traceparent=traceparent, session_id=session_id,
         )
 
     # Models that can't tool-call (e.g. Nova): one LLM attempt, then keyword fallback.
@@ -374,7 +374,7 @@ async def orchestrate(
         try:
             response = await gateway.chat(
                 messages, agent_id=agent_id, tools=None, user=user, model=model,
-                traceparent=traceparent,
+                traceparent=traceparent, session_id=session_id,
             )
         except Exception as e:  # noqa: BLE001
             if _is_denial(e):

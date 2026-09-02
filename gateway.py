@@ -1,14 +1,16 @@
 """Every outbound call this app makes goes through Kong.
 
 Nothing here talks to an LLM provider or an MCP server directly. Both go
-through cloud-hosted Kong routes; Kong's custom plugin calls Reva PDP before
+through cloud-hosted Kong routes; Kong's custom plugin calls Reva Trust Gateway before
 proxying.
 
-Identity for that plugin rides in X-Reva-Agent-Id / X-Reva-User.
+Identity for that plugin is a JWT on Authorization (claim `sub` = the user).
+Kong key-auth still uses the `apikey` header. Agent headers are not sent:
+authorize_agent is off on the plugin.
 
 `traceparent` (W3C Trace Context): minted once per chat turn in the app (or
 forwarded from ingress / a nested Kong hop) and sent on every Kong call so all
-PDP evals in that turn share one trace. Kong still mints only if a hop arrives
+RTG evals in that turn share one trace. Kong still mints only if a hop arrives
 with none.
 
 Deny contract: Kong should respond HTTP 403 with a body/message containing
@@ -17,6 +19,8 @@ Deny contract: Kong should respond HTTP 403 with a body/message containing
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import secrets
@@ -86,19 +90,41 @@ def _require_a2a_url() -> str:
     return KONG_A2A_URL
 
 
+def _b64url(obj: dict[str, Any]) -> str:
+    raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def user_jwt(user: str) -> str:
+    """Unsigned JWT whose `sub` is the user id.
+
+    The plugin decodes Authorization and reads jwt_user_claim (default sub).
+    It does not verify the signature — Kong jwt / OIDC in front of it would.
+    The dummy third segment must be non-empty; the plugin's JWT matcher
+    requires three dotted parts.
+    """
+    return f"{_b64url({'alg': 'none', 'typ': 'JWT'})}.{_b64url({'sub': user})}.x"
+
+
 def _kong_headers(
     *,
     agent_id: str | None = None,
     user: str | None = None,
     traceparent: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
+    del agent_id  # plugin authorize_agent=false: User JWT is subject and principal
     headers: dict[str, str] = {}
-    if agent_id:
-        headers["X-Reva-Agent-Id"] = agent_id
     if user:
-        headers["X-Reva-User"] = user
+        headers["Authorization"] = f"Bearer {user_jwt(user)}"
     if traceparent:
         headers["traceparent"] = traceparent
+    if session_id:
+        # The chat this turn belongs to. traceparent changes every message, so
+        # it cannot group turns; without this header the plugin sees each
+        # message as a brand new conversation and session.messages stays empty.
+        headers["X-Reva-Session-Id"] = session_id
+    headers["apikey"] = _require_key()
     return headers
 
 
@@ -118,11 +144,12 @@ async def chat(
     user: str | None = None,
     model: str | None = None,
     traceparent: str | None = None,
+    session_id: str | None = None,
 ) -> Any:
     """One LLM turn, routed through Kong.
 
-    `agent_id` / `user` → identity headers. Pass the turn's `traceparent` so
-    Kong/PDP see the same trace as sibling MCP/A2A hops.
+    `user` → JWT on Authorization (`sub`). Pass the turn's `traceparent` so
+    Kong/RTG see the same trace as sibling MCP/A2A hops.
     """
     used = model or LLM_MODEL
     log.info(
@@ -130,12 +157,16 @@ async def chat(
         _require_llm_url(), agent_id, user or "-", used,
         len(tools or []), len(messages), _tp(traceparent),
     )
+    headers = _kong_headers(
+        agent_id=agent_id, user=user, traceparent=traceparent,
+        session_id=session_id,
+    )
+    # The SDK always sends Authorization from api_key. That must be the user
+    # JWT, not KONG_API_KEY — Kong key-auth reads `apikey` from headers.
     client = AsyncOpenAI(
-        api_key=_require_key(),
+        api_key=user_jwt(user) if user else "unused",
         base_url=_require_llm_url(),
-        default_headers=_kong_headers(
-            agent_id=agent_id, user=user, traceparent=traceparent
-        ),
+        default_headers={k: v for k, v in headers.items() if k != "Authorization"},
     )
     kwargs: dict[str, Any] = {"model": used, "messages": messages}
     if tools:
@@ -170,11 +201,10 @@ def _mcp_client(
     agent_id: str | None = None,
     user: str | None = None,
     traceparent: str | None = None,
+    session_id: str | None = None,
 ) -> Client:
-    headers = {
-        "Authorization": f"Bearer {_require_key()}",
-        **_kong_headers(agent_id=agent_id, user=user, traceparent=traceparent),
-    }
+    headers = _kong_headers(agent_id=agent_id, user=user, traceparent=traceparent,
+                            session_id=session_id)
     return Client(
         StreamableHttpTransport(
             url=f"{_require_mcp_url()}/{server}/mcp",
@@ -232,11 +262,15 @@ async def call_tool(
     agent_id: str | None = None,
     user: str | None = None,
     traceparent: str | None = None,
+    session_id: str | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> Any:
     """Invoke one MCP tool through Kong.
 
     A Reva denial surfaces as AuthorizationDenied — the tool's code never runs.
     Callers should catch it and tell the user they were not authorized.
+    `history` is sent as MCP `_meta.chatHistory` so Kong can put prior turns
+    in session.messages.
     """
     log.info(
         "kong mcp call → %s/%s tool=%s agent=%s args_keys=%s traceparent=%s",
@@ -246,9 +280,16 @@ async def call_tool(
     )
     try:
         async with _mcp_client(
-            server, agent_id=agent_id, user=user, traceparent=traceparent
+            server, agent_id=agent_id, user=user, traceparent=traceparent,
+            session_id=session_id,
         ) as c:
-            result = await c.call_tool(tool, arguments)
+            kwargs: dict[str, Any] = {}
+            if history:
+                kwargs["meta"] = {"chatHistory": history}
+            try:
+                result = await c.call_tool(tool, arguments, **kwargs)
+            except TypeError:
+                result = await c.call_tool(tool, arguments)
             log.info("kong mcp call ← ok server=%s tool=%s", server, tool)
             return result.structured_content or result.content
     except AuthorizationDenied:
@@ -314,10 +355,8 @@ async def send_agent(
         },
     )
     request = SendMessageRequest(id=str(uuid.uuid4()), params=MessageSendParams(message=message))
-    headers = {
-        "Authorization": f"Bearer {_require_key()}",
-        **_kong_headers(agent_id=agent_id, user=user, traceparent=traceparent),
-    }
+    headers = _kong_headers(agent_id=agent_id, user=user, traceparent=traceparent,
+                            session_id=session_id)
     try:
         async with httpx.AsyncClient(headers=headers, timeout=90.0) as hc:
             client = A2AClient(httpx_client=hc, url=url)

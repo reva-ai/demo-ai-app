@@ -12,6 +12,9 @@
 # Deploy: push this dir to a Git repo -> Render -> New -> Blueprint -> pick the repo.
 # Point Kong upstreams at the four MCP/agent service URLs after deploy.
 #
+# Paste the ngrok (or Kong Cloud) URLs into agent-app (and KONG_LLM_URL on
+# ticketing-agent). sync: false means Render prompts for them in the dashboard.
+#
 # Free plan note: a service sleeps after ~15 min idle and cold-starts (~40s) on the
 # next request. Hit each /healthz (or /mcp) once before presenting so the first
 # real call is warm.
@@ -27,17 +30,19 @@ services:
     envVars:
       - key: LLM_MODEL
         value: gpt-4o
-      # Kong OpenAI-compatible LLM route and MCP proxy base (no trailing slash).
-      # Set these to your Kong Cloud host paths after routes exist.
+      # Get these from dataplane/up.sh (or the ngrok inspector):
+      #   KONG_LLM_URL=https://<ngrok>/llm
+      #   KONG_MCP_URL=https://<ngrok>/mcp
+      #   KONG_A2A_URL=https://<ngrok>/a2a
       - key: KONG_LLM_URL
         sync: false
       - key: KONG_MCP_URL
         sync: false
-      # A2A base for sub-agents: each agent hangs off this as /<agent-name>.
       - key: KONG_A2A_URL
         sync: false
+      # Non-empty so the app starts. reva-ai-governance does not check key-auth.
       - key: KONG_API_KEY
-        sync: false
+        value: not-used-by-reva-ai-governance
 
   - type: web
     name: billing-mcp
@@ -60,15 +65,13 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python ticketing_agent_server.py
     envVars:
-      # Sub-agent makes its own model call through Kong under identity ticketing-agent.
+      # Nested model call through Kong under identity ticketing-agent.
       - key: LLM_MODEL
         value: gpt-4o
       - key: KONG_LLM_URL
         sync: false
-      - key: KONG_MCP_URL
-        sync: false
       - key: KONG_API_KEY
-        sync: false
+        value: not-used-by-reva-ai-governance
 
   - type: web
     name: booking-agent
