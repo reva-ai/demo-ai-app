@@ -95,15 +95,31 @@ def _b64url(obj: dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def user_jwt(user: str) -> str:
-    """Unsigned JWT whose `sub` is the user id.
+# Demo roster: which group each "on behalf of" user carries, so
+# reva-ai-governance's jwt_groups_claim (default: groups) has something to
+# read. Keep in sync with static/index.html's <select id="user">.
+USER_GROUPS: dict[str, list[str]] = {
+    "alice@analyst": ["EndUser"],
+    "bob@intern": ["EndUser"],
+    "dan@finance": ["EndUser"],
+    "carol@free": ["EndUser"],
+    "admin@ops": ["Admin"],
+}
 
-    The plugin decodes Authorization and reads jwt_user_claim (default sub).
-    It does not verify the signature — Kong jwt / OIDC in front of it would.
-    The dummy third segment must be non-empty; the plugin's JWT matcher
-    requires three dotted parts.
+
+def user_jwt(user: str) -> str:
+    """Unsigned JWT whose `sub` is the user id and `groups` its role.
+
+    The plugin decodes Authorization and reads jwt_user_claim (default sub)
+    and jwt_groups_claim (default groups). It does not verify the
+    signature — Kong jwt / OIDC in front of it would. The dummy third segment
+    must be non-empty; the plugin's JWT matcher requires three dotted parts.
     """
-    return f"{_b64url({'alg': 'none', 'typ': 'JWT'})}.{_b64url({'sub': user})}.x"
+    payload: dict[str, Any] = {"sub": user}
+    groups = USER_GROUPS.get(user)
+    if groups:
+        payload["groups"] = groups
+    return f"{_b64url({'alg': 'none', 'typ': 'JWT'})}.{_b64url(payload)}.x"
 
 
 def _kong_headers(
