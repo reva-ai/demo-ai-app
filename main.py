@@ -14,8 +14,9 @@ import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -86,6 +87,31 @@ _a2a_app = a2a_agent.build_app(
 # Mounted, not run standalone: this service already runs its own uvicorn
 # (main:app) per render.yaml. a2a_agent.run() is for the separate sub-agent
 # processes (ticketing-agent, booking-agent), not this one.
+#
+# Registered explicitly ahead of the mount below: Starlette's Mount redirects
+# a request for the bare "/a2a" (no trailing slash, no sub-path) to "/a2a/",
+# and Kong's Route+Service path composition has been observed sending exactly
+# that bare form here. Kong doesn't follow redirects when proxying, so that
+# 307 was surfacing straight to the caller. Naively fixing it by following
+# redirects client-side would be worse, not better: the redirect target is
+# this service's own public URL, so a followed retry would hit it directly,
+# bypassing Kong — and therefore Reva — entirely on the one call this
+# checkpoint exists to have evaluated. Handling the bare path in-process here
+# avoids the redirect happening at all, so every request genuinely stays on
+# the one path that went through Kong.
+@app.post("/a2a")
+async def a2a_bare(request: Request) -> Response:
+    transport = httpx.ASGITransport(app=_a2a_app)
+    body = await request.body()
+    async with httpx.AsyncClient(transport=transport, base_url="http://a2a") as c:
+        r = await c.post(
+            "/", content=body,
+            headers={k: v for k, v in request.headers.items() if k.lower() != "host"},
+        )
+    return Response(content=r.content, status_code=r.status_code,
+                     headers=dict(r.headers), media_type=r.headers.get("content-type"))
+
+
 app.mount("/a2a", _a2a_app)
 
 
