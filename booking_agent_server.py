@@ -6,21 +6,62 @@ forbidding the other.
 
 Kong A2A route path segment must be `booking-agent`.
 
+Like ticketing-agent, this agent makes its own model call (as booking-agent,
+via Kong) to interpret the request — a real, independently-governed hop, not
+just string matching. The model picks a slot; this code still validates that
+pick against the real slot list before ever confirming a booking, so a model
+cannot hallucinate a booking for a slot that doesn't exist.
+
 Run:
     .venv/bin/python booking_agent_server.py         # http://127.0.0.1:8004/
 """
 
 from __future__ import annotations
 
-import re
+import logging
 from typing import Any
 
 from a2a.types import AgentSkill
 
 import a2a_agent
+import gateway
 
+log = logging.getLogger("demo.booking")
+
+AGENT_ID = "booking-agent"
 _SLOTS = ["2026-07-14T10:00Z", "2026-07-14T14:00Z", "2026-07-15T09:00Z"]
-_SLOT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z")
+
+_SYSTEM = (
+    "You are a scheduling agent for support callbacks. The only real slots "
+    "are: " + ", ".join(_SLOTS) + ". Reply with exactly one of: "
+    "LIST (the user wants to see availability), one of the slot timestamps "
+    "above verbatim (the user wants to book that specific slot), or NONE "
+    "(they want a time that isn't in the list). No other text."
+)
+
+
+def _forward(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"role": m["role"], "content": m["content"]}
+        for m in history
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+
+
+async def _interpret(
+    text: str, history: list[dict[str, Any]], user: str | None,
+    *, traceparent: str | None, session_id: str | None,
+) -> str:
+    """Ask a model (as this agent, via Kong) which slot the request means."""
+    messages = [{"role": "system", "content": _SYSTEM}, *_forward(history),
+                {"role": "user", "content": text}]
+    log.info("interpret via kong agent=%s user=%s traceparent=%s",
+              AGENT_ID, user or "-", (traceparent or "")[:50] or "(none)")
+    r = await gateway.chat(
+        messages, agent_id=AGENT_ID, user=user, traceparent=traceparent,
+        session_id=session_id,
+    )
+    return (r.choices[0].message.content or "").strip()
 
 
 async def handle(
@@ -32,16 +73,22 @@ async def handle(
     traceparent: str | None = None,
 ) -> str:
     """Delegated task from the orchestrator: list or book a callback slot."""
-    del history, user, session_id, traceparent  # no nested Kong calls
-    lowered = text.lower()
-    if "list" in lowered or "available" in lowered or "slot" in lowered and "book" not in lowered:
+    log.info("a2a handle text_len=%d history=%d user=%s", len(text or ""), len(history or []), user or "-")
+    try:
+        verdict = await _interpret(text, history, user, traceparent=traceparent,
+                                   session_id=session_id)
+    except gateway.AuthorizationDenied:
+        log.warning("booking model call DENIED by Reva")
+        return "I could not check availability — my own model call was denied by Reva."
+    except Exception as e:  # noqa: BLE001
+        log.warning("booking model call failed: %s", str(e)[:160])
         return "Available callback slots: " + ", ".join(_SLOTS)
 
-    wanted = _SLOT_RE.search(text)
-    slot = wanted.group(0) if wanted else _SLOTS[0]
-    if slot not in _SLOTS:
-        return f"Slot {slot} is unavailable. Options: " + ", ".join(_SLOTS)
-    return f"Booked callback slot {slot}."
+    if verdict in _SLOTS:
+        return f"Booked callback slot {verdict}."
+    if verdict == "NONE":
+        return "That time isn't available. Options: " + ", ".join(_SLOTS)
+    return "Available callback slots: " + ", ".join(_SLOTS)
 
 
 SKILLS = [
