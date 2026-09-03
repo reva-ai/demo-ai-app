@@ -33,9 +33,9 @@ services:
       #   KONG_A2A_URL=https://<ngrok>/a2a
       - key: KONG_A2A_URL
         sync: false
-      # Non-empty so the app starts. reva-ai-governance does not check key-auth.
+      # A real Kong Consumer apikey — key-auth is global, every route needs one.
       - key: KONG_API_KEY
-        value: not-used-by-reva-ai-governance
+        sync: false
 
   - type: web
     name: billing-support-agent
@@ -52,7 +52,7 @@ services:
       - key: KONG_A2A_URL
         sync: false
       - key: KONG_API_KEY
-        value: not-used-by-reva-ai-governance
+        sync: false
 
   - type: web
     name: ticketing-agent
@@ -69,7 +69,7 @@ services:
       - key: KONG_MCP_URL
         sync: false
       - key: KONG_API_KEY
-        value: not-used-by-reva-ai-governance
+        sync: false
 
   - type: web
     name: booking-agent
@@ -86,7 +86,7 @@ services:
       - key: KONG_MCP_URL
         sync: false
       - key: KONG_API_KEY
-        value: not-used-by-reva-ai-governance
+        sync: false
 
   - type: web
     name: ticketing-mcp
