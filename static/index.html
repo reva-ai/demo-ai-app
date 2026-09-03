@@ -308,10 +308,9 @@ function event(e) {
     return;
   }
   const isModel = e.kind === 'model';
-  const isAgent = e.kind === 'agent';
-  const action = isModel ? 'invokeModel' : isAgent ? 'invokeAgent' : 'invokeTool';
-  const target = isModel ? `${e.server} → ${e.tool}` : isAgent ? e.server : `${e.server}/${e.tool}`;
-  const key = (isModel ? 'm:' : isAgent ? 'a:' : 't:') + `${e.server}/${e.tool || ''}`;
+  const action = isModel ? 'invokeModel' : 'invokeTool';
+  const target = isModel ? `${e.server} → ${e.tool}` : `${e.server}/${e.tool}`;
+  const key = (isModel ? 'm:' : 't:') + `${e.server}/${e.tool}`;
 
   let card = cards[key];
   if (!card) { card = document.createElement('div'); cards[key] = card; events.appendChild(card); }

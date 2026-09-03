@@ -29,9 +29,6 @@ load_dotenv(Path(__file__).with_name(".env"))
 os.environ.setdefault("OPENAI_LOG", "debug")
 
 import agents  # noqa: E402 — after the OPENAI_LOG default above, on purpose
-import gateway  # noqa: E402
-import a2a_agent  # noqa: E402
-from a2a.types import AgentSkill  # noqa: E402
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "DEBUG").upper(),
@@ -42,51 +39,6 @@ log = logging.getLogger("demo.main")
 _STATIC = Path(__file__).with_name("static")
 
 app = FastAPI(title="Reva Kong Agentic Demo", version="0.2.0")
-
-
-async def _checkpoint_handler(
-    text: str,
-    history: list[dict[str, Any]],
-    user: str | None,
-    session_id: str | None,
-    *,
-    traceparent: str | None = None,
-) -> str:
-    """Answers the self-referential A2A call orchestrate() makes on itself.
-
-    By the time this runs, Kong has already asked Reva to authorize invoking
-    this agent and proxied the call through — that decision already happened.
-    This handler's only job is to complete the round trip; it must NOT invoke
-    orchestrate() itself, or every chat message would re-enter this same
-    check in a loop.
-    """
-    del history, user, session_id, traceparent
-    log.info("self-checkpoint answered text_len=%d", len(text or ""))
-    return "ok"
-
-
-_a2a_app = a2a_agent.build_app(
-    name=agents.ORCHESTRATOR_ID,
-    description="Billing support orchestrator — this endpoint exists only so "
-                "Kong/Reva can authorize 'invoke this agent' before a chat "
-                "turn starts; it does no real work.",
-    skills=[
-        AgentSkill(
-            id="checkpoint",
-            name="Authorization checkpoint",
-            description="Always answers 'ok'. Real work happens via /chat, "
-                        "only after this call is authorized.",
-            tags=["internal"],
-            examples=[],
-        ),
-    ],
-    handler=_checkpoint_handler,
-    url=f"{gateway.AGENT_URL}/a2a/" if gateway.AGENT_URL else None,
-)
-# Mounted, not run standalone: this service already runs its own uvicorn
-# (main:app) per render.yaml. a2a_agent.run() is for the separate sub-agent
-# processes (ticketing-agent, booking-agent), not this one.
-app.mount("/a2a", _a2a_app)
 
 
 @app.get("/")
