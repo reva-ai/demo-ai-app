@@ -1,0 +1,105 @@
+"""billing-support-agent — the orchestrator, a standalone A2A service like
+every other agent in this app. Its only two "tools" are delegating to
+ticketing-agent and booking-agent, each a real A2A message/send call through
+Kong; which one (if either) fits is entirely the model's tool-calling
+decision — no keyword/regex dispatch anywhere in this file.
+
+The browser never calls this service directly: main.py's /chat is a thin
+client that reaches this agent the exact same way this agent reaches
+ticketing-agent/booking-agent — gateway.send_agent(), through Kong.
+
+Run:
+    .venv/bin/python billing_support_agent_server.py   # http://127.0.0.1:8002/
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+
+from a2a.types import AgentSkill
+
+import a2a_agent
+import gateway
+import llm_agent
+
+log = logging.getLogger("demo.billing_support")
+
+AGENT_ID = "billing-support-agent"
+DELEGATES = ["ticketing-agent", "booking-agent"]
+_DESCRIPTIONS = {
+    "ticketing-agent": "Delegate to the ticketing agent to open/close and triage support tickets.",
+    "booking-agent": "Delegate to the booking agent to list or book customer callback slots.",
+}
+
+SYSTEM = """You are a helpful billing support agent. You have no tools of \
+your own — you can only delegate to two specialist agents (ticketing or \
+booking) when the request fits one of them, or answer directly yourself \
+otherwise. Decide using the tools available to you; never guess from \
+keywords.
+
+After a delegate replies, summarize its answer for the user in clear, \
+natural language — like a support agent, not a log dump. Do not paste raw \
+JSON or internal names.
+
+A delegation may be refused by policy. If that happens, say plainly that \
+you are not authorized for that action and continue with what you can do. \
+Never invent data, and never pretend a refused delegation succeeded."""
+
+
+async def handle(
+    text: str,
+    history: list[dict],
+    user: str | None,
+    session_id: str | None,
+    *,
+    traceparent: str | None = None,
+) -> str:
+    """Delegated task from /chat, or (if you swap identities mid-demo) from
+    another caller entirely — either way, this is a real A2A call through
+    Kong, evaluated by Reva like any other hop."""
+    log.info("a2a handle text_len=%d history=%d user=%s", len(text or ""), len(history or []), user or "-")
+    emit = llm_agent.log_emit(log)
+    full_history = llm_agent.build_history(history, text)
+    tools = llm_agent.delegate_tool_defs(DELEGATES, _DESCRIPTIONS)
+    execute = llm_agent.a2a_delegate_executor(
+        agent_id=AGENT_ID, user=user, session_id=session_id,
+        traceparent=traceparent, history=full_history, emit=emit,
+    )
+    try:
+        reply = await llm_agent.run_loop(
+            text, agent_id=AGENT_ID, system=SYSTEM, tools=tools, execute_tool=execute,
+            user=user, emit=emit, history=history, session_id=session_id,
+            traceparent=traceparent,
+        )
+    except gateway.AuthorizationDenied:
+        return json.dumps({
+            "reply": f"Reva denied '{AGENT_ID}' permission to call the model. The model was never contacted.",
+            "note": f"{AGENT_ID}'s own model call was DENIED by Reva.",
+        })
+    return json.dumps({"reply": reply, "reasoned_by": f"{AGENT_ID} (own tool-calling loop via Kong)"})
+
+
+SKILLS = [
+    AgentSkill(
+        id="route_support_request",
+        name="Route support request",
+        description="Understand a billing support request and delegate it to the ticketing or "
+                    "booking specialist agent when it fits; answers directly otherwise.",
+        tags=["billing", "support", "orchestration"],
+        examples=["Open a ticket for customer c1 about a billing discrepancy.",
+                  "What callback slots are available?"],
+    ),
+]
+
+
+app = a2a_agent.build_app(
+    name="billing-support-agent",
+    description="Billing support orchestrator: delegates to ticketing/booking specialist agents.",
+    skills=SKILLS,
+    handler=handle,
+)
+
+
+if __name__ == "__main__":
+    a2a_agent.run(app, default_port="8002")
