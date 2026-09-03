@@ -1,16 +1,9 @@
 """booking-agent — the second sub-agent, exposed over A2A for the same reason.
-
-Companion to ticketing_agent_server.py. Two sub-agents rather than one because
-agent-to-agent traffic needs a choice: a policy can permit one delegation while
-forbidding the other.
+Companion to ticketing_agent_server.py, structurally identical: a real LLM
+tool-calling loop against its own MCP server (booking-mcp), no keyword logic
+anywhere in this file.
 
 Kong A2A route path segment must be `booking-agent`.
-
-Like ticketing-agent, this agent makes its own model call (as booking-agent,
-via Kong) to interpret the request — a real, independently-governed hop, not
-just string matching. The model picks a slot; this code still validates that
-pick against the real slot list before ever confirming a booking, so a model
-cannot hallucinate a booking for a slot that doesn't exist.
 
 Run:
     .venv/bin/python booking_agent_server.py         # http://127.0.0.1:8004/
@@ -18,84 +11,66 @@ Run:
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
 
 from a2a.types import AgentSkill
 
 import a2a_agent
 import gateway
+import llm_agent
 
 log = logging.getLogger("demo.booking")
 
 AGENT_ID = "booking-agent"
-_SLOTS = ["2026-07-14T10:00Z", "2026-07-14T14:00Z", "2026-07-15T09:00Z"]
+MCP_SERVER = "booking-mcp"
 
-_SYSTEM = (
-    "You are a scheduling agent for support callbacks. The only real slots "
-    "are: " + ", ".join(_SLOTS) + ". Reply with exactly one of: "
-    "LIST (the user wants to see availability), one of the slot timestamps "
-    "above verbatim (the user wants to book that specific slot), or NONE "
-    "(they want a time that isn't in the list). No other text."
-)
+SYSTEM = """You are a scheduling agent for customer support callbacks. Use \
+your tools to list available callback slots and book a slot for the user's \
+request. Use tools when needed, then reply in clear, natural language — \
+never claim a slot is booked unless a tool told you it was.
 
-
-def _forward(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {"role": m["role"], "content": m["content"]}
-        for m in history
-        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
-    ]
-
-
-async def _interpret(
-    text: str, history: list[dict[str, Any]], user: str | None,
-    *, traceparent: str | None, session_id: str | None,
-) -> str:
-    """Ask a model (as this agent, via Kong) which slot the request means."""
-    messages = [{"role": "system", "content": _SYSTEM}, *_forward(history),
-                {"role": "user", "content": text}]
-    log.info("interpret via kong agent=%s user=%s traceparent=%s",
-              AGENT_ID, user or "-", (traceparent or "")[:50] or "(none)")
-    r = await gateway.chat(
-        messages, agent_id=AGENT_ID, user=user, traceparent=traceparent,
-        session_id=session_id,
-    )
-    return (r.choices[0].message.content or "").strip()
+Some tools may be refused by policy. If that happens, say so plainly."""
 
 
 async def handle(
     text: str,
-    history: list[dict[str, Any]],
+    history: list[dict],
     user: str | None,
     session_id: str | None,
     *,
     traceparent: str | None = None,
 ) -> str:
-    """Delegated task from the orchestrator: list or book a callback slot."""
+    """Delegated task from the orchestrator."""
     log.info("a2a handle text_len=%d history=%d user=%s", len(text or ""), len(history or []), user or "-")
+    emit = llm_agent.log_emit(log)
+    full_history = llm_agent.build_history(history, text)
+    tools = await llm_agent.discover_mcp_tools(
+        MCP_SERVER, agent_id=AGENT_ID, user=user, traceparent=traceparent, emit=emit,
+    )
+    execute = llm_agent.mcp_tool_executor(
+        MCP_SERVER, agent_id=AGENT_ID, user=user, session_id=session_id,
+        traceparent=traceparent, history=full_history, emit=emit,
+    )
     try:
-        verdict = await _interpret(text, history, user, traceparent=traceparent,
-                                   session_id=session_id)
+        reply = await llm_agent.run_loop(
+            text, agent_id=AGENT_ID, system=SYSTEM, tools=tools, execute_tool=execute,
+            user=user, emit=emit, history=history, session_id=session_id,
+            traceparent=traceparent,
+        )
     except gateway.AuthorizationDenied:
-        log.warning("booking model call DENIED by Reva")
-        return "I could not check availability — my own model call was denied by Reva."
-    except Exception as e:  # noqa: BLE001
-        log.warning("booking model call failed: %s", str(e)[:160])
-        return "Available callback slots: " + ", ".join(_SLOTS)
-
-    if verdict in _SLOTS:
-        return f"Booked callback slot {verdict}."
-    if verdict == "NONE":
-        return "That time isn't available. Options: " + ", ".join(_SLOTS)
-    return "Available callback slots: " + ", ".join(_SLOTS)
+        return json.dumps({
+            "reply": "I could not check availability — my own model call was denied by Reva.",
+            "note": f"{AGENT_ID}'s own model call was DENIED by Reva.",
+        })
+    return json.dumps({"reply": reply, "reasoned_by": f"{AGENT_ID} (own tool-calling loop via Kong)"})
 
 
 SKILLS = [
     AgentSkill(
         id="list_slots",
         name="List slots",
-        description="List available callback slots for a customer support call.",
+        description="List available callback slots via the agent's own tool-calling loop.",
         tags=["booking", "scheduling"],
         examples=["What callback slots are available?"],
     ),
@@ -111,7 +86,7 @@ SKILLS = [
 
 app = a2a_agent.build_app(
     name="booking-agent",
-    description="Scheduling sub-agent: lists and books customer callback slots on delegation.",
+    description="Scheduling sub-agent: lists and books customer callback slots via its own MCP tools.",
     skills=SKILLS,
     handler=handle,
 )
