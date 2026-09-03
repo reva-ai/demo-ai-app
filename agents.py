@@ -343,6 +343,33 @@ async def orchestrate(
         (traceparent or "")[:50] or "(none)",
     )
 
+    # The conversation to forward on A2A delegations: prior user/assistant turns
+    # plus the current message. Sub-agents receive this as metadata.chatHistory so
+    # Reva evaluates the invokeAgent hop with the same context the orchestrator has.
+    # Built before the checkpoint call below, which needs it too.
+    convo: list[dict[str, Any]] = [
+        {"role": m["role"], "content": m["content"]}
+        for m in (history or [])
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+    convo.append({"role": "user", "content": message})
+
+    # Checkpoint: is `user` allowed to invoke this agent at all, before it does
+    # anything? The browser calls this process directly (never through Kong),
+    # so without this the "user invokes the orchestrator" hop would never be
+    # evaluated by Reva at all. This call goes out through Kong to a route
+    # pointing back at this same service (see a2a_agent mount in main.py) —
+    # by the time our own handler answers it, Reva has already decided.
+    try:
+        await gateway.send_agent(
+            agent_id, message, history=convo[:-1], session_id=session_id,
+            user=user, traceparent=traceparent,
+        )
+    except gateway.AuthorizationDenied:
+        emit({"type": "denied", "kind": "agent", "server": agent_id})
+        return f"Reva denied '{user}' permission to invoke '{agent_id}'."
+    emit({"type": "allowed", "kind": "agent", "server": agent_id})
+
     tools = await _available_tools(
         emit, servers, agent_id=agent_id, user=user, traceparent=traceparent,
     )
@@ -351,15 +378,6 @@ async def orchestrate(
     # (e.g. Nova). The keyword→tool fallback still runs tools through Kong/Reva.
     tool_capable = "nova" not in (used_model or "").lower()
     send_tools = tools if tool_capable else None
-    # The conversation to forward on A2A delegations: prior user/assistant turns
-    # plus the current message. Sub-agents receive this as metadata.chatHistory so
-    # Reva evaluates the invokeAgent hop with the same context the orchestrator has.
-    convo: list[dict[str, Any]] = [
-        {"role": m["role"], "content": m["content"]}
-        for m in (history or [])
-        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
-    ]
-    convo.append({"role": "user", "content": message})
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM}, *convo]
 
