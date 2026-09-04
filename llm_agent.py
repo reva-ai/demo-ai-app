@@ -77,7 +77,13 @@ def parse_reply_envelope(reply: str) -> dict[str, Any]:
 
 def emit_nested_card(server: str, payload: dict[str, Any], emit: Emit) -> None:
     nested_model = gateway.LLM_MODEL
-    if payload.get("reasoned_by"):
+    if payload.get("error"):
+        # Never reached Kong at all - a bad config or network failure, not a
+        # verdict. Rendered as a plain note (type=error), never an allowed/
+        # denied card, so it can't be mistaken for something Reva decided.
+        emit({"type": "error",
+              "text": f"{server}'s own model call errored, not via Reva: {payload['error']}"})
+    elif payload.get("reasoned_by"):
         emit({"type": "allowed", "kind": "model", "server": server, "tool": nested_model})
     elif "DENIED by Reva" in str(payload.get("note", "")):
         emit({"type": "denied", "kind": "model", "server": server, "tool": nested_model})
@@ -104,10 +110,14 @@ async def run_loop(
     return a JSON string; this loop never knows whether that executor speaks
     MCP or A2A — that split lives entirely in which executor the caller passes.
 
-    Raises gateway.AuthorizationDenied if the model call itself is denied —
-    callers decide how to phrase that. A denied *tool* call is not raised: it
-    is fed back to the model as a tool result (see the executors below), so
-    the model can explain itself instead of the loop crashing.
+    Raises gateway.AuthorizationDenied if the model call itself is denied, or
+    the original exception for any other failure (bad config, network) —
+    callers decide how to phrase either. Never swallowed into a plain string
+    return: that would look identical to a real reply and, via reasoned_by in
+    the caller's envelope, identical to a Reva-permitted call in the trace. A
+    denied *tool* call is not raised: it is fed back to the model as a tool
+    result (see the executors below), so the model can explain itself instead
+    of the loop crashing.
     """
     used_model = model or gateway.LLM_MODEL
     messages: list[dict[str, Any]] = [
@@ -125,7 +135,7 @@ async def run_loop(
                 emit({"type": "denied", "kind": "model", "server": agent_id, "tool": used_model})
                 raise gateway.AuthorizationDenied(str(e)) from e
             emit({"type": "error", "server": "llm", "tool": used_model, "text": str(e)[:160]})
-            return f"The model call failed: {str(e)[:160]}"
+            raise
 
         emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
         choice = response.choices[0].message
