@@ -11,8 +11,16 @@ Run:
 import os
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 mcp = FastMCP("ticketing-mcp")
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> JSONResponse:
+    """Plain liveness check, outside the MCP protocol - for a keep-warm loop."""
+    return JSONResponse({"status": "ok"})
 
 
 @mcp.tool

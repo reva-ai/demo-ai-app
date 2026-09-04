@@ -11,8 +11,17 @@ Run:
 import os
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 mcp = FastMCP("booking-mcp")
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> JSONResponse:
+    """Plain liveness check, outside the MCP protocol - for a keep-warm loop."""
+    return JSONResponse({"status": "ok"})
+
 
 _SLOTS = ["2026-07-14T10:00Z", "2026-07-14T14:00Z", "2026-07-15T09:00Z"]
 
