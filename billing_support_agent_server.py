@@ -77,6 +77,13 @@ async def handle(
             "reply": f"Reva denied '{AGENT_ID}' permission to call the model. The model was never contacted.",
             "note": f"{AGENT_ID}'s own model call was DENIED by Reva.",
         })
+    except Exception as e:  # noqa: BLE001
+        log.exception("own model call errored: %s", e)
+        return json.dumps({
+            "reply": "I hit an internal error and couldn't process that — not a policy decision, "
+                     "something on my end is misconfigured.",
+            "error": str(e)[:160],
+        })
     return json.dumps({"reply": reply, "reasoned_by": f"{AGENT_ID} (own tool-calling loop via Kong)"})
 
 
