@@ -28,6 +28,8 @@ from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 from a2a.utils import new_agent_text_message
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # handler(text, history, user, session_id, *, traceparent) -> reply text
 Handler = Callable[..., Awaitable[str]]
@@ -101,7 +103,16 @@ def build_app(
         agent_executor=_HandlerExecutor(handler),
         task_store=InMemoryTaskStore(),
     )
-    return A2AStarletteApplication(agent_card=card, http_handler=request_handler).build()
+    app = A2AStarletteApplication(agent_card=card, http_handler=request_handler).build()
+    # Plain liveness check - no A2A/Reva plumbing, just proves the process is up.
+    # Render's free tier sleeps an idle service, so this is also what a
+    # keep-warm loop should hit rather than guessing at an A2A-shaped request.
+    app.add_route("/healthz", _healthz, methods=["GET"])
+    return app
+
+
+async def _healthz(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
 
 
 def run(app, default_port: str) -> None:
