@@ -49,17 +49,6 @@ async def index() -> FileResponse:
     return FileResponse(_STATIC / "index.html")
 
 
-@app.get("/ui")
-async def index_alias() -> FileResponse:
-    """Same page under a second path.
-
-    Render's free tier fronts the service with a hibernation proxy that
-    answers "/" itself, so the request never reaches this app and the UI
-    appears to 404. Any other path passes through untouched.
-    """
-    return FileResponse(_STATIC / "index.html")
-
-
 class ChatRequest(BaseModel):
     message: str
     user: str = "alice@analyst"

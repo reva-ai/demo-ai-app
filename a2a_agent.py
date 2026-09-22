@@ -104,9 +104,7 @@ def build_app(
         task_store=InMemoryTaskStore(),
     )
     app = A2AStarletteApplication(agent_card=card, http_handler=request_handler).build()
-    # Plain liveness check - no A2A/Reva plumbing, just proves the process is up.
-    # Render's free tier sleeps an idle service, so this is also what a
-    # keep-warm loop should hit rather than guessing at an A2A-shaped request.
+    # Plain liveness check — no A2A/Reva plumbing, just proves the process is up.
     app.add_route("/healthz", _healthz, methods=["GET"])
     return app
 
@@ -116,5 +114,5 @@ async def _healthz(request: Request) -> JSONResponse:
 
 
 def run(app, default_port: str) -> None:
-    """Serve the A2A app; Render injects $PORT, locally falls back."""
+    """Serve the A2A app. Uses PORT when the host sets it, otherwise default_port."""
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", default_port)))

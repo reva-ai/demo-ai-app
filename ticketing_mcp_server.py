@@ -19,7 +19,7 @@ mcp = FastMCP("ticketing-mcp")
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> JSONResponse:
-    """Plain liveness check, outside the MCP protocol - for a keep-warm loop."""
+    """Liveness check, outside the MCP protocol."""
     return JSONResponse({"status": "ok"})
 
 

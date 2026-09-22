@@ -2,7 +2,8 @@
 
 The Kong demo app works against the `reva-ai-governance` plugin. Identity is a
 JWT on `Authorization` (`sub` = the UI user). Kong key-auth uses `apikey`.
-`X-Reva-Agent-Id` / `X-Reva-User` are not sent (`authorize_agent` is off).
+Leave `PUBLIC_URL` unset so `X-Reva-Agent-Id` is not sent (`authorize_agent`
+is off). `X-Reva-User` is not sent.
 
 Only the environment differs.
 
@@ -32,20 +33,18 @@ the reva-ai-governance gateway has no `key-auth`, so the value is not checked.
 
 Then open http://localhost:8600.
 
-## Render
+## Any host
 
-A second service, separate from the `reva-kong-dataplane` gateway:
+The same variables work wherever the process runs. This repo is six processes;
+README.md lists the command, port, and variables for each one. `agent-app`
+starts with:
 
-| Setting | Value |
-|---|---|
-| Language | Python 3 |
-| Root Directory | `reva-kong-plugin/demo-app` |
-| Build Command | `pip install -r requirements.txt` |
-| Start Command | `uvicorn main:app --host 0.0.0.0 --port $PORT` |
-| Health Check Path | `/healthz` |
+```
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
 
-Environment variables are the same five, with the gateway's public URL in
-place of localhost.
+Health check path: `/healthz`. Leave `PUBLIC_URL` unset unless a policy matches
+the agent by its public URL — when it is unset, `X-Reva-Agent-Id` is not sent.
 
 ## Verified
 

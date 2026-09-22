@@ -1,9 +1,8 @@
-# Reva × Kong — Agentic Demo
+# Agentic demo
 
-Billing-support agentic app hosted on **Render**. Every LLM and MCP hop goes
-through your **cloud-hosted Kong**; a Kong plugin you write there calls **Reva
-RTG** for allow/deny. This repo does **not** contain a Kong plugin or talk to
-Reva directly.
+Billing-support chat app. The browser talks to `agent-app`. Every model call, tool call, and agent handoff goes through your Kong gateway, and a plugin on Kong calls Reva for allow or deny. This repo does not contain that plugin and does not talk to Reva itself.
+
+Nothing here is tied to a particular host. Each service is one Python process. Run them on a laptop, in containers, or on any platform that can set environment variables and route HTTP.
 
 ## Architecture
 
@@ -11,130 +10,218 @@ Reva directly.
 User
   │
   ▼
-agent-app (Render)   chat UI + orchestrator
+agent-app                         chat UI + /chat
   │
-  ├─ LLM  ──► Kong ──► (plugin → Reva Trust Gateway) ──► upstream model
-  │
-  ├─ MCP  ──► Kong ──► (plugin → Reva Trust Gateway) ──► billing-mcp
-  │                                        └► external-mcp
-  │
-  └─ A2A  ──► Kong ──► (plugin → Reva Trust Gateway) ──► ticketing-agent
-                                           └► booking-agent
+  └─ A2A  ──► Kong ──► billing-support-agent
+                          │
+                          ├─ LLM ──► Kong ──► upstream model
+                          │
+                          ├─ A2A ──► Kong ──► ticketing-agent
+                          │                     ├─ LLM ──► Kong ──► upstream model
+                          │                     └─ MCP ──► Kong ──► ticketing-mcp
+                          │
+                          └─ A2A ──► Kong ──► booking-agent
+                                                ├─ LLM ──► Kong ──► upstream model
+                                                └─ MCP ──► Kong ──► booking-mcp
 ```
 
-Tools are reached over **MCP**; sub-agents over the **A2A protocol**
-(`message/send`). Both traverse Kong, so orchestrator→ticketing is a standard
-A2A call that Reva authorizes (`invokeAgent`). A raw HTTP call would bypass it.
-The conversation travels the A2A-native way — current turn as the message text,
-prior turns in `metadata.chatHistory`, thread as `contextId` — so Reva evaluates
-with full context and no custom headers.
+Sub-agents are reached with A2A `message/send`. Tools are reached with MCP. Both go through Kong, so Reva sees `invokeAgent` and `invokeTool` rather than a raw HTTP call that skips the plugin.
 
-## Services (Render Blueprint)
+## Services
 
-| Service | Role |
-|---------|------|
-| `agent-app` | FastAPI: `/`, `/chat`, `/healthz` |
-| `billing-mcp` | Demo tools (report / compliance / PII) |
-| `external-mcp` | Untrusted `analytics_probe` |
-| `ticketing-agent` | Sub-agent A2A; own LLM hop via Kong |
-| `booking-agent` | Sub-agent A2A (slots) |
+| Process | Role | Listen | Health |
+|---------|------|--------|--------|
+| `agent-app` | Chat UI. `POST /chat` calls `billing-support-agent` through Kong. | `8000` | `GET /healthz` |
+| `billing-support-agent` | Orchestrator. Own model call, then delegates to the two specialists. | `8002` | `GET /healthz` |
+| `ticketing-agent` | Opens, closes, and checks tickets via `ticketing-mcp`. | `8003` | `GET /healthz` |
+| `booking-agent` | Lists and books callback slots via `booking-mcp`. | `8004` | `GET /healthz` |
+| `ticketing-mcp` | Canned tools: `open_ticket`, `close_ticket`, `get_ticket_status`. | `8005` | `GET /healthz` |
+| `booking-mcp` | Canned tools: `list_slots`, `book_slot`. | `8006` | `GET /healthz` |
 
-Deploy: push the repo → Render → New → Blueprint → select the repo (`render.yaml`).
+Ports above are the defaults when `PORT` is unset. A host that injects `PORT` overrides them. Every process binds `0.0.0.0`.
 
-## Local run
+Kong must be able to reach the three agents and both MCP servers. The agent processes must be able to reach Kong. If Kong is not on the same machine, publish those processes on addresses Kong can call.
+
+## Prerequisites
+
+- Python 3.12 or newer
+- A Kong (or compatible) gateway in front of the model, the MCP servers, and the A2A agents, with your Reva plugin on those routes
+
+Install once:
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill KONG_* and LLM_MODEL
+cp .env.example .env
+```
 
-# terminals: MCP servers (or use Render URLs via Kong only)
-python billing_mcp_server.py &
-python external_mcp_server.py &
-python ticketing_agent_server.py &
-python booking_agent_server.py &
+Fill in `.env` before starting the agents. See the per-process tables below for which values each one actually reads.
 
-uvicorn main:app --reload --port 8000
+## Run locally
+
+Start the processes from the repo root, in this order. The agents load `.env` from the current directory. The MCP servers do not read `.env`; their defaults are enough locally.
+
+```bash
+# MCP servers — no Kong settings
+python ticketing_mcp_server.py          # http://127.0.0.1:8005/mcp
+python booking_mcp_server.py            # http://127.0.0.1:8006/mcp
+
+# agents — need the Kong variables in .env
+python billing_support_agent_server.py  # http://127.0.0.1:8002/
+python ticketing_agent_server.py        # http://127.0.0.1:8003/
+python booking_agent_server.py          # http://127.0.0.1:8004/
+
+# UI
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Open http://localhost:8000
 
-## Env vars
+Point Kong's upstreams at those local URLs (or at whatever public address you published them on):
 
-| Variable | Purpose |
-|----------|---------|
-| `KONG_LLM_URL` | OpenAI-compatible base on Kong (no trailing slash) |
-| `KONG_MCP_URL` | MCP proxy base; app calls `{KONG_MCP_URL}/{server}/mcp` |
-| `KONG_A2A_URL` | A2A proxy base; app calls `{KONG_A2A_URL}/{agent}` (message/send) |
-| `KONG_API_KEY` | Kong key-auth (`apikey` header, not Authorization) |
-| `LLM_MODEL` | Model id upstream expects (default `gpt-4o`) |
+| Kong route the app calls | Upstream |
+|--------------------------|----------|
+| `{KONG_LLM_URL}` | your model provider |
+| `{KONG_MCP_URL}/ticketing-mcp/mcp` | `ticketing-mcp` |
+| `{KONG_MCP_URL}/booking-mcp/mcp` | `booking-mcp` |
+| `{KONG_A2A_URL}/billing-support-agent` | `billing-support-agent` |
+| `{KONG_A2A_URL}/ticketing-agent` | `ticketing-agent` |
+| `{KONG_A2A_URL}/booking-agent` | `booking-agent` |
 
-`ticketing-agent` needs the same `KONG_LLM_URL` / `KONG_API_KEY` / `LLM_MODEL`
-because it makes its own model call under identity `ticketing-agent`.
+Server and agent names in those paths are load-bearing. Reva resource ids use `{server}/{tool}` for tools and the agent name for A2A agents.
 
-## Kong plugin contract
+## Run on any host
 
-Configure routes on Kong Cloud so the agent can reach LLM, MCP, and A2A through
-them.
+Same six commands. Give each process its own environment (container, VM, platform service — it does not matter). Install dependencies with `pip install -r requirements.txt`, then start the command for that process. Set `PORT` to the port the host assigned, and set `PUBLIC_URL` to the URL Kong uses as that service's upstream when a policy matches agents by URL.
 
-### Headers on every hop
+A single image is enough for containers. Pass each service's variables at runtime. `.env` is for a local run and is not something to bake into an image. Override the command per container:
 
-| Header | Example | Meaning |
-|--------|---------|---------|
-| `Authorization` | `Bearer <jwt>` (`sub` = user, e.g. `alice@analyst`) | User id for the plugin (subject + principal) |
-| `apikey` | `KONG_API_KEY` | Kong consumer / key-auth |
-| `X-Reva-Session-Id` | uuid | Groups turns into `session.messages` |
-| `traceparent` | `00-<trace>-<span>-01` | W3C Trace Context — **forwarded if present** |
-
-**`traceparent`:** the orchestrator mints one per chat turn when ingress has
-none, and sends it on every Kong hop (LLM / MCP / A2A) so RTG sees one shared
-trace. If `/chat` already has `traceparent`, that value is reused. Kong must:
-
-1. **Prefer** the inbound `traceparent` (do not mint a new one when present).
-2. Copy it onto the RTG callout.
-3. **Forward it upstream** (LLM / MCP / A2A) so nested agents continue the same
-   trace on their own Kong calls.
-4. Use it as the key to accumulate `context.hops` (also Kong's job).
-5. **Generate** only when a hop truly has no `traceparent`.
-
-### Conversation (from the request body)
-
-| Field | LLM (`/llm`) | MCP (`/mcp/*`) | A2A (`/a2a/*`) |
-|-------|--------------|----------------|----------------|
-| `transmission` / prompt | last user message | tool args | message `parts[].text` |
-| `session.messages` | `messages[]` before last user, paired | `_meta.chatHistory` | `metadata.chatHistory` |
-| `context.conversation.messages` | **Kong-maintained** (this turn, keyed by `traceparent`) | same | same |
-| `context.hops` | **Kong-maintained** (keyed by `traceparent`) | same | same |
-| `inputValues` | — | `params.arguments` | — |
-| `session.id` | `X-Reva-Session-Id` | same / `mcp-session-id` | `message.contextId` |
-
-Path layout (demo routes; path identification defaults match these prefixes).
-Agent `resource.id` is the Kong Service URL, not the `/a2a/<name>` segment.
-
-```
-{KONG_MCP_URL}/billing-mcp/mcp      → Render billing-mcp
-{KONG_MCP_URL}/external-mcp/mcp     → Render external-mcp
-{KONG_A2A_URL}/ticketing-agent      → Render ticketing-agent (A2A message/send)
-{KONG_A2A_URL}/booking-agent        → Render booking-agent   (A2A message/send)
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+# command is set per service; see the tables below
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-**Deny:** return **HTTP 403** with a body/message containing `Blocked by Reva`.
-The orchestrator treats that as a soft denial (explains to the user) instead of
-crashing.
+Use each service's `/healthz` as the liveness check. MCP health checks are plain HTTP, not an MCP request.
 
-Map identity headers + body into the Reva Trust Gateway eval (invokeModel / invokeTool /
-invokeAgent). Maintain `context.hops` in the plugin using `traceparent` as the
-correlation key. Update `policyStoreId` to your store.
+## Environment variables
 
-## Demo agents & tools
+Locally, one `.env` in the repo root is enough. `agent-app` loads that file next to `main.py`. The three agents load it from the working directory via `gateway.py`, so start them from the repo root. Variables a process does not use are ignored.
 
-| Identity / server | Notes |
-|-------------------|--------|
-| `billing-support-agent` | Orchestrator (default in UI) |
-| `billing-mcp` | `get_billing_report`, `get_compliance_status`, `get_customer_pii` |
-| `external-mcp` | `analytics_probe` (typically forbidden) |
-| `ticketing-agent` | A2A sub-agent: opens/triages tickets (+ nested LLM) |
-| `booking-agent` | A2A sub-agent: lists/books callback slots |
+On a host, set only the rows marked required for that process.
 
-Server names are load-bearing for Reva resource ids (`{server}/{tool}` for tools,
-`{agent}` for A2A agents).
+### agent-app
+
+Chat UI. One outbound hop: A2A `message/send` to `billing-support-agent`.
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+```
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `KONG_A2A_URL` | yes | A2A base on Kong, no trailing slash. The app calls `{KONG_A2A_URL}/billing-support-agent`. |
+| `KONG_API_KEY` | yes | Kong key-auth. Sent as the `apikey` header. |
+| `PUBLIC_URL` | no | This process's public URL. Sent as `X-Reva-Agent-Id`. Omit it and the header is left off. |
+| `LOG_LEVEL` | no | `DEBUG`, `INFO`, `WARNING`, … Default `DEBUG`. |
+| `OPENAI_LOG` | no | OpenAI SDK HTTP logging. Default `debug`. |
+| `PORT` | no | Pass it to uvicorn as `--port`. Default `8000` in the command above. |
+
+### billing-support-agent
+
+Orchestrator. Own model call, then A2A to `ticketing-agent` and `booking-agent`.
+
+```bash
+python billing_support_agent_server.py
+```
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `KONG_LLM_URL` | yes | OpenAI-compatible base on Kong, no trailing slash. |
+| `KONG_A2A_URL` | yes | A2A base. Calls `{KONG_A2A_URL}/ticketing-agent` and `{KONG_A2A_URL}/booking-agent`. |
+| `KONG_API_KEY` | yes | Kong key-auth (`apikey` header). |
+| `LLM_MODEL` | no | Model id the upstream expects. Default `gpt-4o`. |
+| `PUBLIC_URL` | no | This process's public URL, sent as `X-Reva-Agent-Id`. |
+| `A2A_PUBLIC_URL` | no | URL written on the agent card. When unset: `http://localhost:$PORT/` if `PORT` is set, otherwise `http://localhost:8003/`. |
+| `PORT` | no | Listen port. Default `8002`. |
+
+### ticketing-agent
+
+Own model call, then MCP tools on `ticketing-mcp`.
+
+```bash
+python ticketing_agent_server.py
+```
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `KONG_LLM_URL` | yes | OpenAI-compatible base on Kong, no trailing slash. |
+| `KONG_MCP_URL` | yes | MCP base. Calls `{KONG_MCP_URL}/ticketing-mcp/mcp`. |
+| `KONG_API_KEY` | yes | Kong key-auth (`apikey` header). |
+| `LLM_MODEL` | no | Model id the upstream expects. Default `gpt-4o`. |
+| `PUBLIC_URL` | no | This process's public URL, sent as `X-Reva-Agent-Id`. |
+| `A2A_PUBLIC_URL` | no | URL written on the agent card. When unset: `http://localhost:$PORT/` if `PORT` is set, otherwise `http://localhost:8003/`. |
+| `PORT` | no | Listen port. Default `8003`. |
+
+### booking-agent
+
+Own model call, then MCP tools on `booking-mcp`. Same variables as `ticketing-agent`, except the MCP path is `{KONG_MCP_URL}/booking-mcp/mcp`.
+
+```bash
+python booking_agent_server.py
+```
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `KONG_LLM_URL` | yes | OpenAI-compatible base on Kong, no trailing slash. |
+| `KONG_MCP_URL` | yes | MCP base. Calls `{KONG_MCP_URL}/booking-mcp/mcp`. |
+| `KONG_API_KEY` | yes | Kong key-auth (`apikey` header). |
+| `LLM_MODEL` | no | Model id the upstream expects. Default `gpt-4o`. |
+| `PUBLIC_URL` | no | This process's public URL, sent as `X-Reva-Agent-Id`. |
+| `A2A_PUBLIC_URL` | no | URL written on the agent card. When unset: `http://localhost:$PORT/` if `PORT` is set, otherwise `http://localhost:8003/`. |
+| `PORT` | no | Listen port. Default `8004`. |
+
+### ticketing-mcp
+
+No Kong variables. Does not read `.env`.
+
+```bash
+python ticketing_mcp_server.py
+```
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `PORT` | no | Listen port. Default `8005`. MCP endpoint is `/mcp`. |
+
+### booking-mcp
+
+No Kong variables. Does not read `.env`.
+
+```bash
+python booking_mcp_server.py
+```
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `PORT` | no | Listen port. Default `8006`. MCP endpoint is `/mcp`. |
+
+## What Kong has to do
+
+These headers go out on every hop the app makes:
+
+| Header | Value | Meaning |
+|--------|-------|---------|
+| `Authorization` | `Bearer <jwt>` with `sub` set to the UI user (for example `alice@analyst`) | User identity. The JWT is unsigned; a real deployment can put Kong JWT or OIDC in front. |
+| `apikey` | `KONG_API_KEY` | Kong key-auth. |
+| `X-Reva-Agent-Id` | `PUBLIC_URL` | This service's identity. Sent only when `PUBLIC_URL` is set. Match it to the upstream URL your policy uses for the agent. |
+| `X-Reva-Session-Id` | conversation id | Groups turns into one session. |
+| `traceparent` | W3C trace id | One trace per chat turn. Forward it upstream when it is already present. |
+
+A denial is HTTP 403 with a body that contains `Blocked by Reva`. The app treats that as a soft refusal and explains it in the chat instead of crashing.
+
+`RUNNING-AGAINST-REVA-PDP.md` covers the same app pointed at the `reva-ai-governance` gateway.

@@ -7,7 +7,7 @@ proxying.
 Identity for that plugin is a JWT on Authorization (claim `sub` = the user).
 Kong key-auth still uses the `apikey` header. This service's own identity —
 sent as X-Reva-Agent-Id, read when the plugin's authorize_agent is on — is
-its own Render URL (AGENT_URL), not a name chosen here.
+its public URL (PUBLIC_URL), not a name chosen here.
 
 `traceparent` (W3C Trace Context): minted once per chat turn in the app (or
 forwarded from ingress / a nested Kong hop) and sent on every Kong call so all
@@ -51,13 +51,11 @@ KONG_MCP_URL = os.environ.get("KONG_MCP_URL", "").rstrip("/")
 KONG_A2A_URL = os.environ.get("KONG_A2A_URL", "").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
 
-# This service's own public URL, set by Render at runtime for every web
-# service — https://<name>.onrender.com. Sent as this service's identity on
-# X-Reva-Agent-Id, matching how reva-ai-governance identifies an Agent
-# *resource* on the other side of an A2A call: kong_service_url(), the Kong
-# Service's own upstream URL. Same representation in both directions, so a
-# policy can match on it either way. Empty outside Render (e.g. local dev).
-AGENT_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+# Public URL of this process. Sent as X-Reva-Agent-Id so a policy can match
+# this agent the same way reva-ai-governance identifies an Agent resource:
+# the upstream URL Kong uses for the service. Same representation in both
+# directions. Leave unset locally; the header is omitted when this is empty.
+AGENT_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 
 
 class AuthorizationDenied(Exception):
